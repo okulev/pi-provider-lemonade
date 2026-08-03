@@ -1,6 +1,6 @@
 {
   "name": "pi-provider-lemonade",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "pi extension that auto-discovers downloaded models from a Lemonade Server and exposes them through its OpenAI-compatible API",
   "type": "module",
   "license": "MIT",

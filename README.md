@@ -5,16 +5,16 @@
 
 A [pi](https://pi.dev) extension that registers your local
 [Lemonade Server](https://lemonade-server.ai) as a provider and **discovers its
-downloaded models automatically**. Add a model to the server, restart pi, and it
-is in `/model` — no `models.json` entry, no code change.
+downloaded models automatically**. Add a model to the server, and
+it is available in `/model` — no manual `models.json` updates required.
 
 ```text
 $ pi --list-models lemonade
 provider  model                                 context  max-out  thinking  images
-lemonade  Qwen3-0.6B-GGUF                       41K      16.4K    no        no
-lemonade  Gemma-3-4b-it-GGUF                    512K     16.4K    no        no
+lemonade  Qwen3-4B-GGUF                         41K      16.4K    no        no
+lemonade  gemma-3-4b-it-GGUF                    60K      16.4K    no        no
 lemonade  Llama-3.3-70B-Instruct-GGUF           131K     16.4K    no        no
-lemonade  Qwen3-Coder-30B-Antidote-GGUF         262K     16.4K    no        no
+lemonade  Qwen3-Coder-30B-A3B-Instruct-GGUF     262K     16.4K    no        no
 lemonade  LMX-Omni-52B-Halo                     131K     16.4K    no        no
 ```
 
@@ -40,7 +40,7 @@ lemonade  LMX-Omni-52B-Halo                     131K     16.4K    no        no
    /model                      # or pick one inside the TUI
    ```
 
-That's it — every downloaded model on your Lemonade Server now appears in pi.
+Every downloaded model on your Lemonade Server now appears in pi.
 
 ## Install
 
@@ -111,15 +111,15 @@ included, so every registered model is immediately ready without a download step
 
 From each model entry (all overridable via `models.json` `modelOverrides`):
 
-| pi field | Derived from | Overrideable? |
-| --- | --- | --- |
-| `contextWindow` | From Ollama `/api/show` `model_info`, falling back to `max_context_window` from `/v1/models`, then 128000 | ✅ `modelOverrides` |
-| `maxTokens` | 16384, clamped to `contextWindow` | ✅ `modelOverrides` |
-| `reasoning` | Always `false` (Lemonade uses the model's default thinking) | ✅ `modelOverrides` |
-| `thinkingLevelMap` | `undefined` (effort levels not exposed) | ✅ `modelOverrides` |
-| `input` | `["text"]` (text only — vision labels are not used) | ✅ `modelOverrides` |
-| `cost` | Zero — local inference is free | ✅ `modelOverrides` |
-| `compat` | `supportsDeveloperRole: false`, `supportsStore: false`, `supportsReasoningEffort: false`, `maxTokensField: "max_tokens"` | ✅ `modelOverrides` |
+| pi field | Derived from |
+| --- | --- |
+| `contextWindow` | From Ollama `/api/show` `model_info`, falling back to `max_context_window` from `/v1/models`, then 128000 |
+| `maxTokens` | 16384, clamped to `contextWindow` |
+| `reasoning` | Always `false` (Lemonade uses the model's default thinking) |
+| `thinkingLevelMap` | `undefined` (effort levels not exposed) |
+| `input` | `["text"]` (text only — vision labels are not used) |
+| `cost` | Not reported by server |
+| `compat` | `supportsDeveloperRole: false`, `supportsStore: false`, `supportsReasoningEffort: false`, `maxTokensField: "max_tokens"` |
 
 ## Overriding models via `models.json`
 
@@ -131,37 +131,19 @@ like any other pi provider. This keeps configuration in one place and avoids
 scattering extension-specific env vars across your shell.
 
 All numeric, capability, and compat fields are set with sensible defaults at
-discovery time and can be overridden per-model (or provider-wide) in
-`~/.pi/agent/models.json` — no extension reload needed, just open `/model`:
+discovery time and can be overridden per-model in
+`~/.pi/agent/models.json` - no reload required; open `/model`, just like any other pi provider.
 
 ```json
 {
   "providers": {
     "lemonade": {
       "modelOverrides": {
-        "Qwen3-0.6B-GGUF": {
-          "name": "Qwen3 0.6B (High Ctx)",
+        "Qwen3-4B-GGUF": {
+          "name": "Qwen3 4B (High Ctx)",
           "contextWindow": 131072,
-          "maxTokens": 32768,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "supportsReasoningEffort": false
-          }
+          "maxTokens": 32768
         }
-      }
-    }
-  }
-}
-```
-
-You can also add a provider-level `compat` block to apply to all Lemonade models:
-
-```json
-{
-  "providers": {
-    "lemonade": {
-      "compat": {
-        "supportsReasoningEffort": false
       }
     }
   }
@@ -179,39 +161,11 @@ The model will still use its built-in default for thinking, so reasoning-capable
 models like Qwen3 and DeepSeek continue to reason — pi simply doesn't send
 `reasoning_effort` parameters that the server may not support.
 
-If your server does support effort levels, you can override in `models.json`:
-
-```json
-{
-  "providers": {
-    "lemonade": {
-      "modelOverrides": {
-        "Qwen3-0.6B-GGUF": {
-          "thinkingLevelMap": {
-            "medium": "default",
-            "high": "default",
-            "max": "max"
-          },
-          "compat": {
-            "supportsReasoningEffort": true
-          }
-        }
-      }
-    }
-  }
-}
-```
-
 ## Tool calling
 
 Tool calling (function calling) is supported out of the box via the
 `openai-completions` API. No configuration is needed — pi handles tool
 selection, execution, and result passing automatically.
-
-## Persistent memory (store)
-
-Persistent memory via OpenAI's `store` parameter is **disabled**
-(`supportsStore: false`) because local inference servers don't support it.
 
 ## Live model discovery
 
@@ -269,8 +223,8 @@ Lemonade ignores — it only enforces auth when the key is configured server-sid
 
 While this package is open source, its development is not:
 
-- Only npm-distributed files are kept in <https://github.com/okulev/pi-provider-lemonade>.
-  Development files (tests, type configs) are not published to npm.
+- Only npm-distributed files are kept in [the GitHub repository](https://github.com/okulev/pi-provider-lemonade).
+  Development files (tests, type configs) are not published to npm or hosted on GitHub.
 - Only issues are allowed; pull requests are disabled.
   If you find a bug, please [open an issue](https://github.com/okulev/pi-provider-lemonade/issues).
 
