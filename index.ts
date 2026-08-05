@@ -131,10 +131,10 @@ export function readConfig(
 	};
 }
 
-/** Construct an API base URL from a host and port, ensuring it ends in `/v1`. */
+/** Construct a base URL from host and port (without `/v1`). */
 export function buildBaseUrl(host: string, port: string | number): string {
 	const trimmed = host.trim().replace(/\/+$/, "");
-	return `http://${trimmed}:${port}/v1`;
+	return `http://${trimmed}:${port}`;
 }
 
 /** Case-insensitive glob over a model id. */
@@ -152,9 +152,9 @@ export function globMatch(pattern: string, id: string): boolean {
 	return new RegExp(`^${rx}$`, "i").test(id);
 }
 
-/** `http://host:port/v1` → `host:port`, for the provider's display name. */
+/** `http://host:port` → `host:port`, for the provider's display name. */
 function displayHost(baseUrl: string): string {
-	return baseUrl.replace(/^https?:\/\//, "").replace(/\/v1$/, "");
+	return baseUrl.replace(/^https?:\/\//, "").replace(/:\d+$/, "");
 }
 
 // ── model filtering & mapping ────────────────────────────────────────────────
@@ -173,6 +173,20 @@ function displayHost(baseUrl: string): string {
  * that do not expose `completion`+`tools` capabilities and are therefore
  * excluded here.
  */
+
+/**
+ * Sanitize a model ID by replacing control characters,
+ * forward slash, and whitespace with `_`.
+ *
+ * Replaced characters:
+ * - `/` - would corrupt the `lemonade/<id>` selection format
+ * - Whitespace (`\s`) - breaks CLI/TUI model selection
+ * - Control characters (U+0000-U+001F, U+007F-U+009F) - non-printable, cause issues in logs/CLI
+ */
+export function sanitizeModelId(id: string): string {
+	return id.replace(/[\x00-\x1f\x7f-\x9f\s\/]/g, "_");
+}
+
 export function isChatCompletionLLM(m: LemonadeModel): boolean {
 	if (!m.downloaded) return false;
 	const caps = m.capabilities;
@@ -214,11 +228,11 @@ export function toModel(
 	const ctx = !cw || cw <= 0 ? config.contextWindow : cw;
 
 	return {
-		id: m.id,
-		name: m.id,
+		id: sanitizeModelId(m.id),
+		name: sanitizeModelId(m.id),
 		api: "openai-completions",
 		provider: config.provider,
-		baseUrl: config.baseUrl,
+		baseUrl: config.baseUrl + "/v1",
 		reasoning: false, // Lemonade uses the model's default thinking (lemonade-sdk/lemonade#1511)
 		input: ["text"] as ("text" | "image")[], // pi only sends text input
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -273,11 +287,6 @@ interface OllamaShowResult {
 
 const OLLAMA_CONCURRENCY = 5;
 
-/** Strip the /v1 suffix from the base URL to reach the Ollama-compatible API. */
-function ollamaApiUrl(baseUrl: string, path: string): string {
-	return baseUrl.replace(/(?:\/v1$|\/$)/, "") + path;
-}
-
 /** Find the context length inside an Ollama model_info object by looking for
  *  a *.context_length key with a positive numeric value. Returns undefined
  *  when absent or non-positive. */
@@ -309,7 +318,7 @@ async function fetchOllamaShow(
 	const controller = new AbortController();
 	const id = setTimeout(() => controller.abort(), timeoutMs);
 	try {
-		const res = await fetchImpl(ollamaApiUrl(baseUrl, "/api/show"), {
+		const res = await fetchImpl(`${baseUrl}/api/show`, {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
@@ -390,7 +399,7 @@ export async function discoverModels(
 
 	try {
 		const bearer = credentialKey ?? config.apiKey;
-		const res = await fetchImpl(`${config.baseUrl}/models`, {
+		const res = await fetchImpl(`${config.baseUrl}/v1/models`, {
 			headers: { Authorization: `Bearer ${bearer}` },
 			signal: signal ?? AbortSignal.timeout(config.timeoutMs),
 		});
@@ -399,11 +408,7 @@ export async function discoverModels(
 		const payload = (await res.json()) as { data?: LemonadeModel[] };
 		entries = (payload?.data ?? []).filter(
 			(m): m is LemonadeModel =>
-				typeof m?.id === "string" &&
-				m.id.length > 0 &&
-				!m.id.includes("/") && // a "/" would corrupt lemonade/<id> selection
-				!/\s/.test(m.id) && // whitespace breaks CLI/TUI model selection
-				m.downloaded === true, // only locally-present models
+				typeof m?.id === "string" && m.id.length > 0 && m.downloaded === true, // only locally-present models
 		);
 		if (entries.length === 0)
 			throw new Error("server returned no downloaded models");
@@ -489,7 +494,7 @@ export default async function (pi: ExtensionAPI) {
 	pi.registerProvider({
 		id: config.provider,
 		name: `Lemonade (${displayHost(config.baseUrl)})`,
-		baseUrl: config.baseUrl,
+		baseUrl: config.baseUrl + "/v1",
 		auth: {
 			apiKey: {
 				name: "Lemonade Server API key",
@@ -580,7 +585,7 @@ export default async function (pi: ExtensionAPI) {
 	if (!initial.error) return;
 
 	const message =
-		`Model discovery from ${config.baseUrl} failed (${initial.error}). ` +
+		`Model discovery from ${config.baseUrl}/v1 failed (${initial.error}). ` +
 		`Registered provider "${config.provider}" with a single "discovery-failed" model. ` +
 		`Start the server and run /reload, or set LEMONADE_HOST/LEMONADE_PORT.`;
 

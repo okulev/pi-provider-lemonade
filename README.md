@@ -3,79 +3,64 @@
 [![npm](https://img.shields.io/npm/v/pi-provider-lemonade)](https://www.npmjs.com/package/pi-provider-lemonade)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-A [pi](https://pi.dev) extension that registers your local
+[Pi](https://pi.dev) extension that registers your local
 [Lemonade Server](https://lemonade-server.ai) as a provider and **discovers its
 downloaded models automatically**. Add a model to the server, and
 it is available in `/model` — no manual `models.json` updates required.
 
-```text
-$ pi --list-models lemonade
-provider  model                                 context  max-out  thinking  images
-lemonade  Qwen3-4B-GGUF                         41K      16.4K    no        no
-lemonade  gemma-3-4b-it-GGUF                    60K      16.4K    no        no
-lemonade  Llama-3.3-70B-Instruct-GGUF           131K     16.4K    no        no
-lemonade  Qwen3-Coder-30B-A3B-Instruct-GGUF     262K     16.4K    no        no
-lemonade  LMX-Omni-52B-Halo                     131K     16.4K    no        no
-```
-
 ## Quick Start
 
-1. **Ensure Lemonade Server is running** and has at least one downloaded model:
+1. **Prepare your models**
+   Ensure your [Lemonade Server](https://lemonade-server.ai) is running and you have downloaded at least one model.
+   - **In Web UI / Desktop App:** Use the **"Downloaded Only"** checkbox to quickly see which models are ready.
+   - **In CLI:** Run `lemonade list --downloaded`.
 
-   ```sh
-   lemonade list --downloaded
-   ```
-
-2. **Install the extension** into pi:
+2. **Install the extension**
+   Install into Pi via the CLI:
 
    ```sh
    pi install npm:pi-provider-lemonade
    ```
 
-3. **Select a model**:
+3. **Select a model**
+   Inside the Pi TUI, run:
 
-   ```sh
-   pi --model 'lemonade/gemma-3-4b-it-GGUF'
-   pi --models 'lemonade/*'    # cycle every Lemonade model with Ctrl+P
-   /model                      # or pick one inside the TUI
+   ```
+   /model
    ```
 
-Every downloaded model on your Lemonade Server now appears in pi.
+   (or use the `ctrl-l` keybinding). Pick any `lemonade/...` entry from the list.
 
-## Install
+4. **Refresh the catalog**
+   If you download new models, update the list without restarting:
 
-```sh
-pi install npm:pi-provider-lemonade  # from npm
-```
+   ```
+   /reload
+   ```
 
-Or straight from git, pinned, or just for one run:
-
-```sh
-pi install git:github.com/okulev/pi-provider-lemonade
-pi install npm:pi-provider-lemonade@1       # pinned to 1.x, skipped by pi update
-pi -e npm:pi-provider-lemonade              # try without installing
-```
+   (or `pi update --models` in the CLI).
 
 ## Configuration
 
-The extension reads the same environment variables the Lemonade CLI uses for
-server address and authentication:
+### Server Connection
 
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `LEMONADE_HOST` | `127.0.0.1` | Server host address. |
-| `LEMONADE_PORT` | `13305` | Server port. |
-| `LEMONADE_API_KEY` | `sk-lemonade-local` | Sent as `Authorization: Bearer`. Lemonade ignores it unless `LEMONADE_API_KEY` is set server-side. |
+The extension connects to your local Lemonade server using the following environment variables:
 
-These match the `lemonade` CLI's `--host` / `--port` / `--api-key` flags. If your
-server is on a different host or port, set the env vars and all Lemonade tools
-(including pi) stay in sync:
+| Variable | Default | Purpose |
+| ---------- | --------- | ---------- |
+| `LEMONADE_HOST` | `127.0.0.1` | Server host address |
+| `LEMONADE_PORT` | `13305` | Server port |
 
-```sh
-export LEMONADE_HOST=192.168.1.100
-export LEMONADE_PORT=13305
-export LEMONADE_API_KEY=your-api-key-here
-```
+The connection is established via `http://${LEMONADE_HOST}:${LEMONADE_PORT}`.
+
+### Authentication
+
+You can authenticate with the server in two ways:
+
+1. **Pi Credential (Preferred):** Run `/login lemonade` inside the Pi TUI. This is the most reliable method and takes priority for live requests and model refreshes.
+2. **Environment Variable:** Set the `LEMONADE_API_KEY` variable.
+
+*Note: Provider-level configuration in `models.json` (like `baseUrl` or `apiKey`) is not supported because this extension uses dynamic discovery. Use environment variables or `/login` instead.*
 
 ## Using models
 
@@ -91,35 +76,45 @@ ctrl-l                      # with keybinding
 `pi --list-models lemonade` shows all discovered models with their context
 window, output cap, thinking, and image support.
 
-## What it reads from your server
+**Note:** The `/model` command only displays already-discovered models - it does NOT make HTTP requests.
 
-At startup the extension calls `GET /v1/models` to list downloaded models, then
-calls the Ollama-compatible `POST /api/show` for each (this is **mandatory** —
-it determines whether the model is included). Only models whose `/api/show`
-reports both `completion` and `tools` capabilities are registered:
+## Model Discovery
 
-| /api/show `capabilities` | Routed to | Included? |
-| --- | --- | --- |
-| `["completion", "tools", …]` | `/v1/chat/completions` | ✅ included |
-| `["completion", …]` (no tools) | chat model, no tool calling | ❌ excluded |
-| `["embedding", …]` | `/v1/embeddings` | ❌ excluded |
-| *(empty — image, transcription, etc.)* | non-LLM model | ❌ excluded |
+The extension automatically discovers models downloaded on your Lemonade server. Only models with `downloaded: true` are included.
 
-If `/api/show` is unavailable for **all** models, discovery degrades to a
-`discovery-failed` fallback model. Only models with `downloaded: true` are
-included, so every registered model is immediately ready without a download step.
+### How it Works
 
-From each model entry (all overridable via `models.json` `modelOverrides`):
+The extension first lists models via the OpenAI-compatible `GET /v1/models` endpoint, then queries each one via the Ollama-compatible `POST /api/show` endpoint to verify its capabilities. Only models supporting **both** `completion` and `tools` are registered:
 
-| pi field | Derived from |
+| /api/show `capabilities` | Included? |
 | --- | --- |
-| `contextWindow` | From Ollama `/api/show` `model_info`, falling back to `max_context_window` from `/v1/models`, then 128000 |
-| `maxTokens` | 16384, clamped to `contextWindow` |
-| `reasoning` | Always `false` (Lemonade uses the model's default thinking) |
-| `thinkingLevelMap` | `undefined` (effort levels not exposed) |
-| `input` | `["text"]` (text only — vision labels are not used) |
-| `cost` | Not reported by server |
-| `compat` | `supportsDeveloperRole: false`, `supportsStore: false`, `supportsReasoningEffort: false`, `maxTokensField: "max_tokens"` |
+| `["completion", "tools", …]` | ✅ Yes |
+| `["completion", …]` (no tools) | ❌ No |
+| `["embedding", …]` | ❌ No |
+| Others (image, transcription, etc.) | ❌ No |
+
+If no capable models are found, a `discovery-failed` fallback model is provided.
+
+### When Discovery Happens
+
+- **At startup:** Automatically performed whenever the `pi` CLI is launched (e.g., starting a TUI session or running `pi --list-models`). **Note:** Initial discovery at startup cannot use the `/login` credential and will rely on the `LEMONADE_API_KEY` environment variable (or the default placeholder).
+- **On demand:** Triggered when you run `/reload` in the TUI or `pi update --models` in the CLI. These actions trigger a model refresh that **uses the `/login` credential if available**, taking priority over environment variables.
+
+*Note: Since `pi update --models` is a CLI command, it first performs the "At startup" discovery (using the env key) and then immediately performs the "On demand" refresh (using the login credential).*
+
+Discovered models are cached in `~/.pi/agent/models-store.json` for faster restarts and offline access.
+
+### Model Properties
+
+The following properties are derived automatically and can be overridden in `models.json`:
+
+| Pi Field | Source / Default |
+| --- | --- |
+| `contextWindow` | From `/api/show` $\rightarrow$ `/v1/models` $\rightarrow$ 128,000 |
+| `maxTokens` | 16,384 (clamped to `contextWindow`) |
+| `reasoning` | `false` (uses model's default thinking) |
+| `input` | `["text"]` |
+| `compat` | `maxTokensField: "max_tokens"`, others `false` |
 
 ## Overriding models via `models.json`
 
@@ -150,74 +145,13 @@ discovery time and can be overridden per-model in
 }
 ```
 
-## Extended thinking (reasoning) is disabled
+## Thinking level control is not exposed
 
-Extended thinking is **always disabled** in pi — `reasoning` is set to `false` and
-`thinkingLevelMap` is `undefined`. Lemonade's chat endpoint uses the model's
-default thinking behavior, and pi does not attempt to toggle it per-request
-(see [lemonade-sdk/lemonade#1511](https://github.com/lemonade-sdk/lemonade/issues/1511)).
+Extended thinking controls (`reasoning`, `thinkingLevelMap`) are **not exposed** because Pi does not send `reasoning_effort` parameters to the Lemonade server. This means you cannot control or customize thinking behavior.
 
-The model will still use its built-in default for thinking, so reasoning-capable
-models like Qwen3 and DeepSeek continue to reason — pi simply doesn't send
-`reasoning_effort` parameters that the server may not support.
+**However:** `reasoning: false` does NOT mean the model will refrain from thinking. The model uses its **built-in default thinking behavior** as configured when the model was built. Reasoning-capable models like Qwen3 and DeepSeek will still think according to their internal defaults — Pi simply doesn't attempt to modify that behavior.
 
-## Tool calling
-
-Tool calling (function calling) is supported out of the box via the
-`openai-completions` API. No configuration is needed — pi handles tool
-selection, execution, and result passing automatically.
-
-## Live model discovery
-
-The extension registers a `refreshModels` callback alongside the initial model
-list. Pi calls it during model refresh and `/reload`, so newly downloaded models
-appear without restarting the process. If a refresh fails, the last-known-good
-list is kept.
-
-## When the server is down
-
-Discovery never blocks pi from starting. On a connection refusal, timeout,
-non-2xx response, malformed body, or empty model list, the extension registers
-the provider anyway with a single `discovery-failed` model and warns once at session
-start:
-
-```text
-[pi-provider-lemonade] Model discovery from http://127.0.0.1:13305/v1 failed
-(fetch failed). Registered provider "lemonade" with a single "discovery-failed" model.
-Start the server and run /reload, or set LEMONADE_HOST/LEMONADE_PORT.
-```
-
-Start the server and `/reload` — no restart needed.
-
-## Authentication
-
-There are two ways to provide an API key when your Lemonade Server requires it.
-
-### Option 1: `LEMONADE_API_KEY` environment variable
-
-Set the same variable in pi's environment before starting:
-
-```sh
-export LEMONADE_API_KEY="your-secret-key"
-pi
-```
-
-### Option 2: `/login lemonade` (persistent)
-
-pi's `/login` command stores your API key in `~/.pi/agent/auth.json`:
-
-```sh
-/login lemonade
-# → Enter your Lemonade API key (leave empty for a placeholder token)
-```
-
-The credential is saved as `{ "type": "api_key", "key": "..." }` and
-automatically used on every subsequent session — no env var needed. Run
-`/reload` to start sending authenticated requests without restarting pi.
-
-When no `LEMONADE_API_KEY` is set and you have not run `/login lemonade`,
-the extension sends a harmless placeholder token (`sk-lemonade-local`) that
-Lemonade ignores — it only enforces auth when the key is configured server-side.
+This limitation exists because Lemonade's chat endpoint does not yet support per-request thinking level configuration (see [lemonade-sdk/lemonade#1511](https://github.com/lemonade-sdk/lemonade/issues/1511)).
 
 ## Closed Development
 
@@ -226,7 +160,7 @@ While this package is open source, its development is not:
 - Only npm-distributed files are kept in [the GitHub repository](https://github.com/okulev/pi-provider-lemonade).
   Development files (tests, type configs) are not published to npm or hosted on GitHub.
 - Only issues are allowed; pull requests are disabled.
-  If you find a bug, please [open an issue](https://github.com/okulev/pi-provider-lemonade/issues).
+  If you find a bug or have a feature request, please [open an issue](https://github.com/okulev/pi-provider-lemonade/issues).
 
 ## License
 

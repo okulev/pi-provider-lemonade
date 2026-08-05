@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-08-05
+
+### Fixed
+
+- **Model ID Sanitization**: Model IDs containing forward slashes (`/`), whitespace, or control characters are now sanitized (replaced with `_`) instead of being excluded. This prevents model identification issues in the Pi CLI/TUI while ensuring all downloaded models are available.
+- **Internal Pathing**: Corrected internal references to `index.ts` (removed legacy `extensions/` subdirectory references).
+- **URL Construction**: Fixed `buildBaseUrl` to return the base host:port without the `/v1` suffix, allowing more flexible routing to different server endpoints (OpenAI vs Ollama).
+
+### Changed
+
+- **README documentation overhauled** for better coherence and clarity:
+  - **Quick Start** is now UI-first, prioritizing the Lemonade Web UI/Desktop App and Pi TUI commands (`/model`, `/reload`).
+  - **Configuration** and **Model Discovery** sections refactored to be more concise.
+  - **API Compatibility clarified**: explicitly detailed the use of OpenAI-compatible (`/v1/models`) and Ollama-compatible (`/api/show`) endpoints.
+  - **Discovery timing clarified**: added detailed explanation of "At startup" vs. "On demand" behavior, specifically for the `pi update --models` command.
+- **`package.json` metadata improved**: updated `description` and `keywords` for better npm discoverability and architectural accuracy.
+- **Dependency model updated**: migrated `@earendil-works/*` packages to `peerDependencies` to ensure zero runtime dependencies, aligning with the `pi-package-template` convention.
+
 ## [1.0.2] - 2026-08-03
 
 ### Changed
@@ -87,6 +105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because Lemonade expects a `"system"` role rather than `"developer"`.
 - **HTTPS not supported** — the base URL always uses `http://`.
 
+[1.0.3]: https://github.com/okulev/pi-provider-lemonade/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/okulev/pi-provider-lemonade/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/okulev/pi-provider-lemonade/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/okulev/pi-provider-lemonade/releases/tag/v1.0.0
