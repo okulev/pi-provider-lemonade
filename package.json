@@ -1,6 +1,6 @@
 {
   "name": "pi-provider-lemonade",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Pi model provider that auto-discovers models from a Lemonade Server and integrates them into Pi via the server's OpenAI-compatible API",
   "type": "module",
   "license": "MIT",
@@ -29,6 +29,9 @@
     "CHANGELOG.md",
     "LICENSE"
   ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
   "pi": {
     "extensions": [
       "index.ts"

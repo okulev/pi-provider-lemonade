@@ -1,8 +1,5 @@
 # pi-provider-lemonade
 
-[![npm](https://img.shields.io/npm/v/pi-provider-lemonade)](https://www.npmjs.com/package/pi-provider-lemonade)
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-
 [Pi](https://pi.dev) extension that registers your local
 [Lemonade Server](https://lemonade-server.ai) as a provider and **discovers its
 downloaded models automatically**. Add a model to the server, and
@@ -10,19 +7,19 @@ it is available in `/model` — no manual `models.json` updates required.
 
 ## Quick Start
 
-1. **Prepare your models**
+1. **Prepare your models:**
    Ensure your [Lemonade Server](https://lemonade-server.ai) is running and you have downloaded at least one model.
    - **In Web UI / Desktop App:** Use the **"Downloaded Only"** checkbox to quickly see which models are ready.
    - **In CLI:** Run `lemonade list --downloaded`.
 
-2. **Install the extension**
+2. **Install the extension:**
    Install into Pi via the CLI:
 
    ```sh
    pi install npm:pi-provider-lemonade
    ```
 
-3. **Select a model**
+3. **Select a model:**
    Inside the Pi TUI, run:
 
    ```
@@ -31,7 +28,7 @@ it is available in `/model` — no manual `models.json` updates required.
 
    (or use the `ctrl-l` keybinding). Pick any `lemonade/...` entry from the list.
 
-4. **Refresh the catalog**
+4. **Refresh the catalog:**
    If you download new models, update the list without restarting:
 
    ```
@@ -110,7 +107,7 @@ The following properties are derived automatically and can be overridden in `mod
 
 | Pi Field | Source / Default |
 | --- | --- |
-| `contextWindow` | From `/api/show` $\rightarrow$ `/v1/models` $\rightarrow$ 128,000 |
+| `contextWindow` | From `/api/show` → `/v1/models` → 128,000 |
 | `maxTokens` | 16,384 (clamped to `contextWindow`) |
 | `reasoning` | `false` (uses model's default thinking) |
 | `input` | `["text"]` |
