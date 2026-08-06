@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.6] - 2026-08-06
+
+### Added
+
+- **pi 0.84 dual-compat**: `refreshModels` supports the new `context.stored` snapshot and `context.publish()` generation-checked transaction alongside the pi 0.83 `context.store` API, detected at runtime.
+
+### Changed
+
+- **`globMatch` refactored** from nested ternary to if-return statements for clarity.
+
 ## [1.0.5] - 2026-08-06
 
 ### Added
@@ -125,7 +135,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because Lemonade expects a `"system"` role rather than `"developer"`.
 - **HTTPS not supported** — the base URL always uses `http://`.
 
-[1.0.4]: https://github.com/okulev/pi-provider-lemonade/compare/v1.0.4...v1.0.5
+[1.0.6]: https://github.com/okulev/pi-provider-lemonade/compare/v1.0.5...v1.0.6
+[1.0.5]: https://github.com/okulev/pi-provider-lemonade/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/okulev/pi-provider-lemonade/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/okulev/pi-provider-lemonade/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/okulev/pi-provider-lemonade/compare/v1.0.1...v1.0.2

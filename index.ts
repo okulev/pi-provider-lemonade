@@ -141,13 +141,11 @@ export function buildBaseUrl(host: string, port: string | number): string {
 export function globMatch(pattern: string, id: string): boolean {
 	const rx = pattern
 		.split("")
-		.map((c) =>
-			c === "*" // pi-lens-ignore: nested-ternary
-				? ".*"
-				: c === "?" // pi-lens-ignore: nested-ternary
-					? "."
-					: c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-		)
+		.map((c) => {
+			if (c === "*") return ".*";
+			if (c === "?") return ".";
+			return c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		})
 		.join("");
 	return new RegExp(`^${rx}$`, "i").test(id);
 }
@@ -478,6 +476,7 @@ function resolveApiKey(
 
 // ── extension factory ────────────────────────────────────────────────────────
 
+// pi-lens-ignore: high-complexity
 export default async function (pi: ExtensionAPI) {
 	const config = readConfig();
 	const env =
@@ -535,23 +534,46 @@ export default async function (pi: ExtensionAPI) {
 		/** Live re-discovery: pi calls this during model refresh and /reload,
 		 *  so new downloads appear without a process restart. On a discovery
 		 *  failure it returns early (no throw) so the last-known-good catalog
-		 *  — or the initial baseline — is retained instead of being replaced. */
+		 *  — or the initial baseline — is retained instead of being replaced.
+		 *
+		 *  Dual-compatible: pi 0.83 uses context.store.read/write;
+		 *  pi 0.84+ uses context.stored (read-only snapshot) +
+		 *  context.publish() (generation-checked transaction). */
 		async refreshModels(
 			this: void,
 			context: RefreshModelsContext,
 		): Promise<void> {
-			const stored = await context.store.read();
-			if (stored) {
-				currentModels = stored.models.filter(
-					(m): m is Model<"openai-completions"> =>
-						m.provider === config.provider && m.api === "openai-completions",
-				);
+			// Detect pi 0.84+ API at runtime (publish function exists).
+			// pi-lens-ignore: no-as-any,no-any-type
+			const ctx = context as any;
+			const hasPublish = typeof ctx.publish === "function";
+
+			// Restore from persisted catalog.
+			if (hasPublish) {
+				// pi 0.84+: context.stored is a read-only ModelsStoreEntry snapshot.
+				if (ctx.stored) {
+					const restored = ctx.stored.models.filter(
+						// pi-lens-ignore: no-any-type
+						(m: any): m is Model<"openai-completions"> =>
+							m.provider === config.provider && m.api === "openai-completions",
+					);
+					if (!(await ctx.publish({
+						update: () => { currentModels = restored; },
+					}))) return;
+				}
+			} else {
+				// pi 0.83: context.store.read() is async.
+				const stored = await context.store.read();
+				if (stored) {
+					currentModels = stored.models.filter(
+						(m): m is Model<"openai-completions"> =>
+							m.provider === config.provider && m.api === "openai-completions",
+					);
+				}
 			}
+
 			if (!context.allowNetwork || context.signal?.aborted) return;
-			// `force` (if provided by the caller) is accepted but currently a no-op:
-			// the provider has no freshness/etag checks, so a refresh always
-			// re-fetches unconditionally. It can gate a future early-exit once
-			// staleness detection exists.
+
 			// Thread the `/login lemonade` credential's bearer into discovery so
 			// a key stored via /login authenticates refresh requests too.
 			const credentialKey =
@@ -566,8 +588,15 @@ export default async function (pi: ExtensionAPI) {
 				credentialKey,
 			);
 			if (error) return;
+			if (context.signal?.aborted) return;
 			currentModels = models;
-			if (!context.signal?.aborted) {
+
+			if (hasPublish) {
+				await ctx.publish({
+					persist: { models: currentModels, checkedAt: Date.now() },
+					update: () => { currentModels; }, // value already set above
+				});
+			} else {
 				await context.store.write({
 					models: currentModels,
 					checkedAt: Date.now(),
@@ -598,9 +627,10 @@ export default async function (pi: ExtensionAPI) {
 			warned = true;
 			if (ctx.hasUI) {
 				ctx.ui.notify(`[pi-provider-lemonade] ${message}`, "warning");
-			} else {
-				console.warn(`[pi-provider-lemonade] ${message}`); // pi-lens-ignore: no-console-except-error,console-statement
-			}
+				} else {
+					// pi-lens-ignore: no-console-except-error,console-statement
+					console.warn(`[pi-provider-lemonade] ${message}`);
+				}
 		},
 	);
 }
