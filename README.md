@@ -70,6 +70,8 @@ pi --models 'lemonade/*'    # cycle every Lemonade model with Ctrl+P
 ctrl-l                      # with keybinding
 ```
 
+Model IDs containing forward slashes (`/`) or whitespace (common with cloud backends like OpenRouter) are automatically handled: the raw ID is sent to the server for compatibility, while a sanitized version is displayed in the TUI.
+
 `pi --list-models lemonade` shows all discovered models with their context
 window, output cap, thinking, and image support.
 
@@ -90,6 +92,8 @@ The extension first lists models via the OpenAI-compatible `GET /v1/models` endp
 | `["embedding", …]` | ❌ No |
 | Others (image, transcription, etc.) | ❌ No |
 
+To optimize your workflow, models are automatically sorted by priority: **pinned** models first, followed by **loaded** models, then **downloaded local** models, and finally **unloaded cloud** models.
+
 If no capable models are found, a `discovery-failed` fallback model is provided.
 
 ### When Discovery Happens
@@ -109,6 +113,7 @@ The following properties are derived automatically and can be overridden in `mod
 | --- | --- |
 | `contextWindow` | From `/api/show` → `/v1/models` → 128,000 |
 | `maxTokens` | 16,384 (clamped to `contextWindow`) |
+| `cost` | From `/v1/models` `cost_input_per_million` / `cost_output_per_million` (USD/1M tokens; 0 for local models) |
 | `reasoning` | `false` (uses model's default thinking) |
 | `input` | `["text"]` |
 | `compat` | `maxTokensField: "max_tokens"`, others `false` |
@@ -149,6 +154,13 @@ Extended thinking controls (`reasoning`, `thinkingLevelMap`) are **not exposed**
 **However:** `reasoning: false` does NOT mean the model will refrain from thinking. The model uses its **built-in default thinking behavior** as configured when the model was built. Reasoning-capable models like Qwen3 and DeepSeek will still think according to their internal defaults — Pi simply doesn't attempt to modify that behavior.
 
 This limitation exists because Lemonade's chat endpoint does not yet support per-request thinking level configuration (see [lemonade-sdk/lemonade#1511](https://github.com/lemonade-sdk/lemonade/issues/1511)).
+
+## Reliability & Diagnostics
+
+To provide these enhancements, the extension replaces the standard `openai-completions` implementation with a specialized `lemonade-completions` layer (which still leverages the OpenAI SDK for core communication).
+
+- **Mid-stream Retries**: To ensure a smooth experience, the extension automatically retries chat completions with exponential backoff if it encounters HTTP 429 (Rate Limit) or 5xx (Server Error) responses mid-stream.
+- **Detailed Error Messages**: If a request fails, the Pi TUI now displays full diagnostic fields from the Lemonade server (such as status codes and error types), making it easier to diagnose connectivity or server-side issues.
 
 ## Closed Development
 

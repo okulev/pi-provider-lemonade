@@ -15,6 +15,14 @@
  *     - `max_context_window` → `contextWindow` fallback when `/api/show`
  *                              does not report a context length
  *     - `downloaded`     → only `true` models are included
+ *     - `cost_input_per_million` / `cost_output_per_million` →
+ *                          `cost.input` / `cost.output` (cloud models)
+ *
+ *   - `GET /v1/health` — enriches with loaded/pinned model state:
+ *     - `all_models_loaded[].pinned` → models currently in memory and pinned.
+ *     - `all_models_loaded[].last_use` → sort pinned/loaded by recency.
+ *     - `all_models_loaded[].model_name` → matched against `/v1/models` ids.
+ *     - Failure is graceful — models retain `pinned: undefined` and sort last.
  *
  *   - Ollama-compatible `POST /api/show` — called for every downloaded model;
  *     **mandatory** — the response determines whether the model is included:
@@ -24,10 +32,15 @@
  *                          takes priority over `max_context_window`.
  *
  * Models are filtered by their Ollama capabilities — only those that report
- * both `"completion"` and `"tools"` appear in the catalogue. Recipe and label
- * fields from `/v1/models` are not consulted. Reasoning and vision detection
- * are disabled: Lemonade's chat endpoint uses the model's default behavior,
- * and pi only sends text input
+ * both `"completion"` and `"tools"` appear in the catalogue. They are sorted:
+ * 1. **Pinned** (pinned by the user via `/v1/load`) — sorted by decreasing `last_use`.
+ * 2. **Loaded** (in memory but not pinned) — sorted by decreasing `last_use`.
+ * 3. **Downloaded, non-cloud** — local models not loaded, case-insensitive sort.
+ * 4. **Downloaded, cloud recipe** — cloud models, lowest priority, case-insensitive sort.
+ *
+ * Recipe and label fields from `/v1/models` are not consulted for filtering.
+ * Reasoning and vision detection are disabled: Lemonade's chat endpoint uses
+ * the model's default behavior, and pi only sends text input
  * (see https://github.com/lemonade-sdk/lemonade/issues/1511).
  *
  * Everything else — context window, output cap, reasoning overrides, compat
@@ -57,10 +70,14 @@ import type {
 	AuthResult,
 	Model,
 	Provider,
-	ProviderStreamOptions,
 	RefreshModelsContext,
 } from "@earendil-works/pi-ai";
-import { stream, streamSimple } from "@earendil-works/pi-ai/compat";
+import {
+	DEFAULT_MAX_RETRIES,
+	DEFAULT_MAX_RETRY_DELAY_SEC,
+	stream,
+	streamSimple,
+} from "./lemonade-completions.ts";
 
 // ── defaults ────────────────────────────────────────────────────────────────
 
@@ -75,7 +92,6 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 16384;
 /** Fallback context window used when both `max_context_window` (from /v1/models)
  *  and the Ollama /api/show `context_length` are missing or non-positive. */
 const DEFAULT_CONTEXT_WINDOW = 128000;
-
 // ── Config ────────────────────────────────────────────────────────────────────
 
 export interface LemonadeModel {
@@ -96,8 +112,19 @@ export interface LemonadeModel {
 	contextLength?: number;
 	downloaded?: boolean;
 	suggested?: boolean;
+	/** Whether an upstream update is available. */
 	update_available?: boolean;
 	labels?: string[];
+	/** Whether the model is currently pinned (from `GET /v1/health`).
+	 *  Populated during discovery; `true` models are sorted first. */
+	pinned?: boolean;
+	/** Unix timestamp of last access (load or inference), from `GET /v1/health`.
+	 *  Used to sort pinned and loaded models by recency. */
+	last_use?: number;
+	/** Input pricing in USD per 1 M tokens (cloud models only; omitted or < 0 when unknown). */
+	cost_input_per_million?: number;
+	/** Output pricing in USD per 1 M tokens (cloud models only; omitted or < 0 when unknown). */
+	cost_output_per_million?: number;
 }
 
 export interface LemonadeConfig {
@@ -147,6 +174,10 @@ export function globMatch(pattern: string, id: string): boolean {
 			return c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 		})
 		.join("");
+	// ReDoS note: pattern is built from the LEMONADE_MODELS env var (local
+	// config) with every char except * and ? escaped, so the compiled
+	// regex is linear.
+	// pi-lens-ignore: detect-non-literal-regexp
 	return new RegExp(`^${rx}$`, "i").test(id);
 }
 
@@ -173,16 +204,14 @@ function displayHost(baseUrl: string): string {
  */
 
 /**
- * Sanitize a model ID by replacing control characters,
- * forward slash, and whitespace with `_`.
+ * Sanitize a model ID by replacing forward slash and whitespace with `_`.
  *
  * Replaced characters:
  * - `/` - would corrupt the `lemonade/<id>` selection format
  * - Whitespace (`\s`) - breaks CLI/TUI model selection
- * - Control characters (U+0000-U+001F, U+007F-U+009F) - non-printable, cause issues in logs/CLI
  */
 export function sanitizeModelId(id: string): string {
-	return id.replace(/[\x00-\x1f\x7f-\x9f\s\/]/g, "_");
+	return id.replace(/[\s/]/g, "_");
 }
 
 export function isChatCompletionLLM(m: LemonadeModel): boolean {
@@ -203,7 +232,9 @@ export function isChatCompletionLLM(m: LemonadeModel): boolean {
  *   models, because Lemonade's OpenAI-compatible endpoint handles image input
  *   differently from pi's `input` field semantics.
  * - `thinkingLevelMap` is `undefined` — effort levels are not exposed.
- * - `cost` is zero because local inference has no token cost.
+ * - `cost` is derived from `/v1/models` `cost_input_per_million` /
+ *   `cost_output_per_million` when present and positive; falls back to
+ *   zero when the server does not report per-token pricing.
  * - `compat.supportsDeveloperRole` is `false` because Lemonade expects a
  *   `"system"` role (not `"developer"`).
  * - `compat.supportsStore` is `false` — local servers don't support OpenAI's
@@ -225,15 +256,26 @@ export function toModel(
 	// 0 would otherwise zero out `contextWindow` and the output cap.
 	const ctx = !cw || cw <= 0 ? config.contextWindow : cw;
 
+	// Cost fields from /v1/models; cloud models carry
+	// cost_input_per_million / cost_output_per_million from discovery.
+	const costInput =
+		m.cost_input_per_million != null && m.cost_input_per_million > 0
+			? m.cost_input_per_million
+			: 0;
+	const costOutput =
+		m.cost_output_per_million != null && m.cost_output_per_million > 0
+			? m.cost_output_per_million
+			: 0;
+
 	return {
-		id: sanitizeModelId(m.id),
+		id: m.id,
 		name: sanitizeModelId(m.id),
 		api: "openai-completions",
 		provider: config.provider,
 		baseUrl: config.baseUrl + "/v1",
 		reasoning: false, // Lemonade uses the model's default thinking (lemonade-sdk/lemonade#1511)
 		input: ["text"] as ("text" | "image")[], // pi only sends text input
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		cost: { input: costInput, output: costOutput, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: ctx,
 		maxTokens: Math.max(1, Math.min(config.maxOutputTokens, ctx)),
 		compat: {
@@ -281,6 +323,98 @@ interface OllamaShowResponse {
 interface OllamaShowResult {
 	capabilities?: string[];
 	contextLength?: number;
+}
+
+/** `GET /v1/health` response — used to determine loaded and pinned models.
+ *  Only the fields needed for discovery are typed here. */
+interface HealthResponse {
+	all_models_loaded?: HealthModel[];
+}
+
+/** One loaded model from `/v1/health` `all_models_loaded`. */
+interface HealthModel {
+	model_name: string;
+	pinned: boolean;
+	last_use?: number;
+	recipe?: string;
+}
+
+/** Enrich models with `pinned` status from `GET /v1/health`. Models that
+ *  appear in `all_models_loaded` get their `pinned` flag attached.
+ *  On failure the health endpoint is treated as unavailable and models
+ *  retain `pinned: undefined`. */
+// pi-lens-ignore: long-parameter-list
+async function fetchHealthEnrichment(
+	models: LemonadeModel[],
+	config: LemonadeConfig,
+	fetchImpl: typeof fetch,
+	bearer: string,
+	timeoutMs: number,
+): Promise<LemonadeModel[]> {
+	const controller = new AbortController();
+	const id = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		const res = await fetchImpl(`${config.baseUrl}/v1/health`, {
+			headers: { Authorization: `Bearer ${bearer}` },
+			signal: controller.signal,
+		});
+		if (!res.ok) return models;
+		const payload = (await res.json()) as HealthResponse;
+		const loadedModels = payload.all_models_loaded ?? [];
+		// Build a map of model_name → { pinned, recipe } from health.
+		const healthMap = new Map(loadedModels.map((m) => [m.model_name, m]));
+		return models.map((m) => {
+			const health = healthMap.get(m.id);
+			if (health) {
+				return {
+					...m,
+					pinned: health.pinned,
+					last_use: m.last_use ?? health.last_use,
+					recipe: m.recipe ?? health.recipe,
+				};
+			}
+			return m;
+		});
+	} catch {
+		return models;
+	} finally {
+		clearTimeout(id);
+	}
+}
+
+/** Sort models by priority: pinned → loaded → downloaded (non-cloud recipe) → downloaded (cloud recipe).
+ *
+ *  Priority groups:
+ *  1. pinned (pinned === true) — highest priority, sorted by decreasing last_use.
+ *  2. loaded (in health's all_models_loaded but pinned === false) — sorted by decreasing last_use.
+ *  3. downloaded with recipe !== "cloud" — local models not currently loaded, case-insensitive sort by id.
+ *  4. downloaded with recipe === "cloud" — cloud models, lowest priority, case-insensitive sort by id.
+ *
+ *  Models not found in health (pinned === undefined) are treated as downloaded.
+ */
+function sortModels(models: LemonadeModel[]): LemonadeModel[] {
+	function groupPriority(m: LemonadeModel): number {
+		if (m.pinned === true) return 0;
+		if (m.pinned === false) return 1; // loaded but not pinned
+		// Not in health — downloaded, sort by recipe
+		const recipe = (m.recipe ?? "").toLowerCase();
+		if (recipe === "cloud") return 3;
+		return 2;
+	}
+
+	return [...models].sort((a, b) => {
+		const ga = groupPriority(a);
+		const gb = groupPriority(b);
+		if (ga !== gb) return ga - gb;
+		// Pinned or loaded groups: sort by decreasing last_use (most recent first).
+		if (ga < 2) {
+			const aLast = a.last_use ?? 0;
+			const bLast = b.last_use ?? 0;
+			return bLast - aLast;
+		}
+		// Downloaded groups: case-insensitive sort by id.
+		return a.id.toLowerCase().localeCompare(b.id.toLowerCase());
+	});
 }
 
 const OLLAMA_CONCURRENCY = 5;
@@ -375,8 +509,12 @@ async function fetchOllamaCapabilities(
  * Fetch and map the server's downloaded model list.
  *
  * 1. `GET /v1/models` — collect downloaded models.
- * 2. `POST /api/show` (mandatory) — attach `capabilities` and `contextLength`.
- * 3. Filter by `completion`+`tools` capability, map to pi `Model` objects.
+ * 2. `GET /v1/health` — enrich with `pinned` status from loaded models.
+ * 3. `POST /api/show` (mandatory) — attach `capabilities` and `contextLength`.
+ * 4. Filter by `completion`+`tools` capability, sort, map to pi `Model` objects.
+ *
+ * Models are sorted: pinned → loaded → downloaded (non-cloud recipe) →
+ * downloaded (cloud recipe), each group case-insensitive sorted by id.
  *
  * Resolves to `{ models, error }` rather than rejecting: a discovery failure
  * degrades to `fallbackModels()` and never takes pi's startup down.
@@ -411,29 +549,30 @@ export async function discoverModels(
 		if (entries.length === 0)
 			throw new Error("server returned no downloaded models");
 
-		// 2. Query the Ollama-compatible /api/show for every downloaded model.
-		//    This is mandatory — /api/show is the source of truth for `capabilities`
-		//    (which models are chat-completion LLMs) and the authoritative
-		//    context length. Per-model failures leave capabilities unset,
-		//    which excludes the model; if all fail, the endpoint is unavailable
-		//    and the final filter below produces "no completion+tools-capable
-		//    models" → graceful fallback.
-		try {
-			entries = await fetchOllamaCapabilities(
-				entries,
-				config,
-				fetchImpl,
-				bearer,
-			);
-		} catch {
-			// Defensive: fetchOllamaCapabilities never throws, but stay safe.
-		}
+		// 2. Fetch /v1/health to enrich with pinned status, and query
+		//    /api/show for capabilities — both in parallel.
+		//    Health failure is graceful (pinned stays undefined → sorted last).
+		const [healthEnriched, showEnriched] = await Promise.all([
+			fetchHealthEnrichment(entries, config, fetchImpl, bearer, config.timeoutMs),
+			fetchOllamaCapabilities(entries, config, fetchImpl, bearer),
+		]);
+		entries = showEnriched.map((showEntry) => {
+			const healthEntry = healthEnriched.find((h) => h.id === showEntry.id);
+			return {
+				...showEntry,
+				pinned: healthEntry?.pinned,
+				recipe: showEntry.recipe ?? healthEntry?.recipe,
+			};
+		});
 
 		// 3. Keep only models whose /api/show reports both "completion" and
 		//    "tools" capabilities.
 		entries = entries.filter((m) => isChatCompletionLLM(m));
 		if (entries.length === 0)
 			throw new Error("server returned no completion+tools-capable models");
+
+		// 4. Sort: pinned → loaded → downloaded (non-cloud) → downloaded (cloud).
+		entries = sortModels(entries);
 	} catch (err) {
 		const reason = err instanceof Error ? err.message : String(err);
 		return { models: fallbackModels(config), error: reason };
@@ -500,8 +639,7 @@ export default async function (pi: ExtensionAPI) {
 				async login(interaction): Promise<ApiKeyCredential> {
 					const key = await interaction.prompt({
 						type: "secret",
-						message:
-							"Lemonade API key (leave empty if server doesn't require auth)",
+						message: "Lemonade API key (leave empty if server doesn't require auth)",
 					});
 					return {
 						type: "api_key",
@@ -557,9 +695,14 @@ export default async function (pi: ExtensionAPI) {
 						(m: any): m is Model<"openai-completions"> =>
 							m.provider === config.provider && m.api === "openai-completions",
 					);
-					if (!(await ctx.publish({
-						update: () => { currentModels = restored; },
-					}))) return;
+					if (
+						!(await ctx.publish({
+							update: () => {
+								currentModels = restored;
+							},
+						}))
+					)
+						return;
 				}
 			} else {
 				// pi 0.83: context.store.read() is async.
@@ -577,9 +720,7 @@ export default async function (pi: ExtensionAPI) {
 			// Thread the `/login lemonade` credential's bearer into discovery so
 			// a key stored via /login authenticates refresh requests too.
 			const credentialKey =
-				context.credential?.type === "api_key"
-					? context.credential.key
-					: undefined;
+				context.credential?.type === "api_key" ? context.credential.key : undefined;
 			const { models, error } = await discoverModels(
 				config,
 				fetch,
@@ -594,7 +735,9 @@ export default async function (pi: ExtensionAPI) {
 			if (hasPublish) {
 				await ctx.publish({
 					persist: { models: currentModels, checkedAt: Date.now() },
-					update: () => { currentModels; }, // value already set above
+					update: () => {
+						currentModels;
+					}, // value already set above
 				});
 			} else {
 				await context.store.write({
@@ -606,9 +749,17 @@ export default async function (pi: ExtensionAPI) {
 		// Lemonade is OpenAI-compatible chat/completions: dispatch through the
 		// openai-completions streaming implementation via the api registry.
 		stream: (model, context, options) =>
-			stream(model, context, options as ProviderStreamOptions | undefined),
+			stream(model, context, {
+				...options,
+				maxRetries: DEFAULT_MAX_RETRIES,
+				maxRetryDelayMs: DEFAULT_MAX_RETRY_DELAY_SEC * 1000,
+			}),
 		streamSimple: (model, context, options) =>
-			streamSimple(model, context, options),
+			streamSimple(model, context, {
+				...options,
+				maxRetries: DEFAULT_MAX_RETRIES,
+				maxRetryDelayMs: DEFAULT_MAX_RETRY_DELAY_SEC * 1000,
+			}),
 	} as Provider<"openai-completions">);
 
 	if (!initial.error) return;
@@ -627,10 +778,10 @@ export default async function (pi: ExtensionAPI) {
 			warned = true;
 			if (ctx.hasUI) {
 				ctx.ui.notify(`[pi-provider-lemonade] ${message}`, "warning");
-				} else {
-					// pi-lens-ignore: no-console-except-error,console-statement
-					console.warn(`[pi-provider-lemonade] ${message}`);
-				}
+			} else {
+				// pi-lens-ignore: no-console-except-error,console-statement
+				console.warn(`[pi-provider-lemonade] ${message}`);
+			}
 		},
 	);
 }

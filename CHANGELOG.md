@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-08-07
+
+### Added
+
+- **Mid-stream SSE Error Retries**: Implemented exponential backoff retries for chat completions when encountering HTTP 429 or 5xx errors mid-stream in `lemonade-completions.ts`.
+- **Enhanced TUI Error Diagnostics**: Error messages in the pi TUI now include full Lemonade Server diagnostic fields (status code, error type, etc.) to aid troubleshooting.
+- **Cost Reporting**: Added support for reporting token costs fetched from the `/v1/models` endpoint.
+- **Pinned/Loaded Model Sorting**: Implemented `GET /v1/health` to detect which models are currently loaded or pinned on the server, allowing them to be sorted higher in the model list.
+- **Response Model Path Cleaning**: Automatically strips the `huggingface/hub/` prefix from the `responseModel` returned by the server for cleaner logs.
+
+### Fixed
+
+- **Model ID Sanitization**: Raw model IDs containing forward slashes (`/`) or whitespace are now preserved in the `id` field for API calls, while a sanitized version is used for the display `name`. This ensures compatibility with servers that use paths as IDs while keeping the TUI selection stable.
+
+### Changed
+
+- **Project Structure**: Moved source files to `src/` for better organization.
+- **Build Configuration**: Updated configuration to include all source files and enable `allowImportingTsExtensions` for improved type-checking.
+
 ## [1.0.6] - 2026-08-06
 
 ### Added
@@ -135,6 +154,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because Lemonade expects a `"system"` role rather than `"developer"`.
 - **HTTPS not supported** — the base URL always uses `http://`.
 
+[1.1.0]: https://github.com/okulev/pi-provider-lemonade/compare/v1.0.6...v1.1.0
 [1.0.6]: https://github.com/okulev/pi-provider-lemonade/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/okulev/pi-provider-lemonade/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/okulev/pi-provider-lemonade/compare/v1.0.3...v1.0.4
