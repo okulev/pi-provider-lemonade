@@ -5,7 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.2] - 2026-08-15
+## [1.1.3] - 2026-08-15
+
+### Changed
+
+- `@earendil-works/pi-ai` is now a declared **runtime dependency** (`^0.84.2`,
+  matching the version bundled with pi 0.84.2) instead of a devDependency. The extension
+  value-imports `convertMessages` from the `@earendil-works/pi-ai/api/openai-completions`
+  subpath, which pi's extension loader resolves from the extensions tree (never from the
+  bundled copy, whose alias map only covers the package root and a few subpaths). With
+  pi-ai only installed as a devDependency, fresh agent environments had no pi-ai in the
+  extensions tree at all, and the extension failed to load with
+  `Cannot find module '@earendil-works/pi-ai/api/openai-completions'`.
+
+### Fixed
+
+- `refreshModels` legacy (pi 0.83) branches now type-check against the 0.84.x
+  `RefreshModelsContext` (no `store` property there) by going through the existing
+  runtime `ctx` reference; runtime behavior is unchanged.
+
+## ## [1.1.2] - 2026-08-15
 
 ### Fixed
 
@@ -174,6 +193,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because Lemonade expects a `"system"` role rather than `"developer"`.
 - **HTTPS not supported** — the base URL always uses `http://`.
 
+[1.1.3]: https://github.com/okulev/pi-provider-lemonade/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/okulev/pi-provider-lemonade/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/okulev/pi-provider-lemonade/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/okulev/pi-provider-lemonade/compare/v1.0.6...v1.1.0

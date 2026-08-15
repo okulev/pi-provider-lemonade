@@ -56,7 +56,9 @@
  * or slow, the provider is still registered with a single `discovery-failed`
  * model and a one-time warning, so it works again as soon as the server is back.
  *
- * Zero runtime dependencies. Install: `pi install npm:pi-provider-lemonade`
+ * Runtime deps: `@earendil-works/pi-ai` (pinned to the pi-bundled version) and
+ * `openai` — the SDK's convertMessages/stream helpers and the OpenAI client.
+ * Install: `pi install npm:pi-provider-lemonade`
  */
 
 import type {
@@ -705,11 +707,12 @@ export default async function (pi: ExtensionAPI) {
 						return;
 				}
 			} else {
-				// pi 0.83: context.store.read() is async.
-				const stored = await context.store.read();
+				// pi 0.83: context.store.read() is async (property absent in 0.84+ types).
+				const stored = await ctx.store.read();
 				if (stored) {
 					currentModels = stored.models.filter(
-						(m): m is Model<"openai-completions"> =>
+						// pi-lens-ignore: no-any-type
+						(m: any): m is Model<"openai-completions"> =>
 							m.provider === config.provider && m.api === "openai-completions",
 					);
 				}
@@ -740,7 +743,7 @@ export default async function (pi: ExtensionAPI) {
 					}, // value already set above
 				});
 			} else {
-				await context.store.write({
+				await ctx.store.write({
 					models: currentModels,
 					checkedAt: Date.now(),
 				});
