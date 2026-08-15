@@ -1,6 +1,6 @@
 {
   "name": "pi-provider-lemonade",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Pi model provider that auto-discovers models from a Lemonade Server and integrates them into Pi via the server's OpenAI-compatible API",
   "type": "module",
   "license": "MIT",
@@ -52,8 +52,7 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "openai": "*"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -62,5 +61,8 @@
     "@google/genai@1.52.0": true,
     "protobufjs@7.6.5": true,
     "esbuild@0.28.1": true
+  },
+  "dependencies": {
+    "openai": "^6.26.0"
   }
 }

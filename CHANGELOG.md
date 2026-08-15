@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-08-15
+
+### Fixed
+
+- **Missing `openai` runtime dependency**: `lemonade-completions.ts` value-imports the
+  `openai` client (`import OpenAI from "openai"`), but the package only declared it as a
+  `peerDependency` (`"openai": "*"`), which pi's npm installer does not install. In a fresh
+  agent environment the shared `node_modules` has no `openai` (it only exists there as a
+  transitive dependency of `@earendil-works/pi-ai`, which is hoisted into the pi install
+  tree, not into the extensions tree), so the extension failed to load with
+  `Cannot find module 'openai'` and pi exited 1 at startup. The dependency is now declared
+  explicitly (`"openai": "^6.26.0"`, matching the version pinned by `@earendil-works/pi-ai`)
+  so npm installs it alongside the extension.
+
 ## [1.1.1] - 2026-08-15
 
 ### Changed
@@ -160,6 +174,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because Lemonade expects a `"system"` role rather than `"developer"`.
 - **HTTPS not supported** — the base URL always uses `http://`.
 
+[1.1.2]: https://github.com/okulev/pi-provider-lemonade/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/okulev/pi-provider-lemonade/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/okulev/pi-provider-lemonade/compare/v1.0.6...v1.1.0
 [1.0.6]: https://github.com/okulev/pi-provider-lemonade/compare/v1.0.5...v1.0.6
