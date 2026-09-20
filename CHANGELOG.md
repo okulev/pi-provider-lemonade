@@ -5,6 +5,144 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-09-20
+
+### Added
+
+- `LEMONADE_HOST` now accepts the same forms as the Lemonade SDK CLI: a bare
+  host (`127.0.0.1`), `host:port` (`192.168.1.100:13305`), or a full
+  `http://`/`https://` URL — parsed by a faithful port of the SDK's
+  `parse_target_url` (case-insensitive schemes, trailing path/query/fragment
+  stripping, strict 1..65535 port validation, bracketed/raw IPv6 handling).
+  The scheme selects `http`/`https`, so TLS reverse-proxy deployments
+  (`LEMONADE_HOST=https://llm.example.com`) are now supported.
+- **`LEMONADE_ADMIN_API_KEY` environment variable**: read with the same
+  precedence as the Lemonade CLI — when both are set, the admin key overrides
+  `LEMONADE_API_KEY`; the `/login lemonade` credential still wins overall.
+  Previously, exporting only the admin key gave a working `lemonade` CLI but a
+  401 from the extension, which was sending the placeholder key.
+- **Streaming backend switch**: the `x-pi-provider-lemonade` header in the
+  `lemonade` provider's `headers` (`~/.pi/agent/models.json`) selects the
+  streaming backend — `openai-completions` routes requests to pi's **built-in**
+  OpenAI-compatible streaming (an escape hatch for pi releases this extension
+  has not been verified against), `lemonade-completions` (the default) keeps
+  the extension's own streaming layer. On a pi release newer than 0.86 without
+  a recognized value, the extension warns once at session start. The header
+  rides on the wire to the Lemonade server, where it is ignored.
+- **pi 0.86 support**: the streaming layer now understands pi 0.86's provider
+  contract, where the system prompt and tool declarations live in the
+  transcript's leading system message instead of `context.systemPrompt` /
+  `context.tools`. On pi ≥ 0.86 every request previously lost both silently,
+  and the agent loop died with no error anywhere.
+- **Thinking level control**: discovered models are registered with
+  `reasoning: true` — the TUI's thinking-level selector now works and the
+  selected level is sent with every request (as `reasoning_effort` with the
+  default `openai` format; with thinking off, nothing is sent). Previously
+  every model was hard-coded `reasoning: false` because the server was
+  believed to ignore per-request thinking configuration. Per-model
+  `reasoning: false` in `models.json` turns it off for models that cannot act
+  on thinking parameters.
+
+### Changed
+
+- Port precedence now matches the Lemonade CLI: an explicit port in
+  `LEMONADE_HOST` wins over `LEMONADE_PORT`; a scheme without a port falls
+  back to 80/443 unless `LEMONADE_PORT` is set (the CLI counts env-sourced
+  values as explicit). An invalid `LEMONADE_PORT` falls back to the built-in
+  default 13305.
+- `buildBaseUrl` now takes the parsed parts `(host, port, isSsl)` and mirrors
+  the SDK client's URL construction (IPv6 hosts bracketed); the old
+  host-trimming behavior moved into the parser.
+- **`@earendil-works/pi-ai` bumped to `~0.86.0`** (0.86.x only) so the
+  streaming layer stays generation-matched to the pi releases it is verified
+  against.
+
+### Fixed
+
+- **Small-context models capped to one token**: the fixed 4,096-token prompt
+  reserve made models with `contextWindow` ≤ 4096 send `max_tokens: 1`
+  (one-token answers). The reserve now scales with the window —
+  `min(4096, max(512, ctx / 8))`, floored at 256 output tokens.
+- **Mid-stream retry after partial output**: a retryable mid-stream error
+  (e.g. a Lemonade 429) re-ran the stream against the same message — partial
+  text was duplicated, `start`/`text_end` events fired twice, and the failed
+  attempt's `usage`/`responseId` leaked into the result. A stream is never
+  retried once content has been emitted.
+- **HTTP-level 429/5xx before the first chunk** were fatal (the OpenAI SDK
+  client runs with `maxRetries: 0`) and `Retry-After` was ignored. They are now
+  retried with exponential backoff like mid-stream errors, honoring a valid
+  `Retry-After` (seconds or HTTP date); a garbage value falls back to the
+  exponential schedule instead of retrying instantly. A pre-stream HTTP error
+  is retried by exactly one layer — previously a body carrying a Lemonade
+  error shape was retried by both, up to `(maxRetries + 1)²` requests.
+- **`modelOverrides.maxTokens` / `samplingParams` were ignored** — the
+  streaming layer bypassed pi's option building, so `max_tokens` was never
+  sent (the backend applied its own default) and `samplingParams` was dropped.
+  `max_tokens` is now sent on every request and `samplingParams` keys are
+  merged into the request body last, overriding any named field (custom keys
+  for llama.cpp/vLLM/SGLang endpoints). `modelOverrides.compat` keys beyond the
+  previously hard-coded set (e.g. `supportsFinishReason`) now pass through to
+  request building.
+- **`compat.thinkingFormat` from `models.json` `modelOverrides` is now
+  honored** in chat-completion requests — a faithful port of pi-ai's
+  openai-completions thinking-parameter handling. Previously the fork only
+  ever sent OpenAI-style `reasoning_effort`, so `qwen-chat-template` /
+  `chat-template` models (e.g. Qwen on llama.cpp) could never receive
+  `chat_template_kwargs: { enable_thinking: false }` when thinking is toggled
+  off in the TUI. Supported formats: `openai` (default, now including the
+  `thinkingLevelMap.off` value when thinking is off), `qwen` (top-level
+  `enable_thinking`), `qwen-chat-template` (sends both
+  `chat_template_kwargs.enable_thinking` and `preserve_thinking`),
+  `chat-template` (configurable `chatTemplateKwargs`
+  with `{ "$var": "thinking.enabled" | "thinking.effort" }` placeholders and
+  `omitWhenOff`), plus `zai`, `baseten`, `deepseek`, `openrouter`, `ant-ling`,
+  `together`, and `string-thinking`.
+- **`usage.cost` was hard-coded zeros** — `calculateCost(model, usage)` was
+  never called, so pricing from `models.json` never reached the TUI.
+  Top-level `cached_tokens` (the Ollama/Lemonade placement) is now read as
+  cache reads instead of 0.
+- **A reachable server with zero eligible models** was reported as a
+  discovery **failure**, so `refreshModels` kept the last-known-good catalog
+  forever and deleting every model never cleared pi's list. It now publishes
+  an empty catalog with an informational notice (a failed `/api/show` probe
+  still fails — capabilities cannot be determined, so that stays a failure).
+- **Discovery had no overall deadline and ignored pi's abort signal** — a
+  half-dead server cost `timeout × ceil(models / 5)` (6 models ≈ 8 s), and an
+  aborted refresh kept issuing `/api/show` batches. Every request in a pass
+  now shares `LEMONADE_DISCOVERY_TIMEOUT_MS` (default 20 s) on top of its own
+  4-second timeout, and a cancelled refresh aborts in-flight requests and
+  skips the pending batches.
+- **`refreshModels` could overwrite a newer catalog** — it assigned the
+  in-memory list before `publish()` and its `update` callback was an
+  expression statement, so a refresh that lost pi's generation check still
+  clobbered the newer in-memory catalog. The catalog is now updated only
+  after a successful publish.
+- **A corrupted persisted catalog** (`models` not an array in
+  `~/.pi/agent/models-store.json`) made `refreshModels` reject with an opaque
+  `TypeError` on both the pi 0.83 and 0.84 restore paths — the provider stayed
+  stuck until the store was repaired by hand. The last-known-good catalog is
+  kept with a one-time warning instead.
+- **`LEMONADE_PORT` validation** now matches `LEMONADE_HOST` port strictness
+  (trimmed base-10 digits, 1..65535): `99999` previously built
+  `http://host:99999` (a later bare `fetch failed`) and `0x10` silently
+  parsed to port 16; both are now corrected with a startup notice.
+- **`LEMONADE_HOST=host:badport`** kept the parser's `-1` sentinel, so the
+  base URL became `http://host:-1` and discovery failed with a bare
+  `fetch failed`; an invalid `LEMONADE_DISCOVERY_TIMEOUT_MS` was also ignored
+  silently. The invalid port is now corrected (`LEMONADE_PORT` when valid,
+  else 13305) and the corrections are reported in the startup notice.
+- **`/v1/health` merge dropped `last_use`**, so pinned/loaded groups tied at
+  `last_use: 0` and sorted by raw `/v1/models` order instead of recency; a
+  health entry omitting its `pinned` field enriched to `pinned: undefined`
+  and silently sorted into the downloaded groups (now defaults to `false`).
+- **Caller-supplied `maxRetries`/`maxRetryDelayMs`** stream options were
+  overwritten with the extension's defaults, and `options.maxRetryDelayMs`
+  was accepted but never read (the 60 s cap was hard-coded). Both are honored
+  now.
+- **`readConfig`'s default env source** was `undefined` on a non-Node host —
+  the first env access threw despite the optional chaining. It now defaults
+  to an empty object.
+
 ## [1.1.3] - 2026-08-15
 
 ### Changed
@@ -24,7 +162,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RefreshModelsContext` (no `store` property there) by going through the existing
   runtime `ctx` reference; runtime behavior is unchanged.
 
-## ## [1.1.2] - 2026-08-15
+## [1.1.2] - 2026-08-15
 
 ### Fixed
 
@@ -193,6 +331,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because Lemonade expects a `"system"` role rather than `"developer"`.
 - **HTTPS not supported** — the base URL always uses `http://`.
 
+[1.2.0]: https://github.com/okulev/pi-provider-lemonade/compare/v1.1.3...v1.2.0
 [1.1.3]: https://github.com/okulev/pi-provider-lemonade/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/okulev/pi-provider-lemonade/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/okulev/pi-provider-lemonade/compare/v1.1.0...v1.1.1

@@ -9,25 +9,33 @@
  * - Uses model.compat directly (Lemonade models always set it explicitly)
  *
  * Retry policy mirrors provider-retry.ts:
- * - HTTP-level retries (408, 409, 429, 5xx) via retryProviderRequest
- * - Mid-stream SSE event retries (429, retryable: true) via retryStreamLoop
+ * - HTTP-level retries (408, 409, 429, 5xx, connection failures) plus
+ *   `Retry-After` / `retry-after-ms` honouring via retryProviderRequest
+ * - Mid-stream SSE event retries (429, retryable: true) via retryStreamLoop,
+ *   only while no content has been emitted yet
  */
 
 import OpenAI from "openai";
 import type { ChatCompletionChunk } from "openai/resources/chat/completions.js";
 import type {
 	AssistantMessage,
-	Context,
+	ChatTemplateKwargValue,
 	Model,
 	SimpleStreamOptions,
 	StreamFunction,
 	TextContent,
 	ThinkingContent,
+	ThinkingLevel,
+	Tool,
 	ToolCall,
+	TranscriptContext,
 } from "@earendil-works/pi-ai";
 import type { OpenAICompletionsOptions } from "@earendil-works/pi-ai/api/openai-completions";
+import { clampMaxTokensToContext } from "@earendil-works/pi-ai/api/simple-options";
 import {
 	type AssistantMessageEventStream,
+	calculateCost,
+	clampThinkingLevel,
 	createAssistantMessageEventStream,
 	parseStreamingJson,
 } from "@earendil-works/pi-ai";
@@ -36,17 +44,34 @@ import { convertMessages as sdkConvertMessages } from "@earendil-works/pi-ai/api
 /** Extended options for Lemonade completions with retry config. */
 export interface LemonadeCompletionsOptions extends OpenAICompletionsOptions {
 	maxRetries?: number;
+	/**
+	 * Thinking level selected in the TUI. The agent loop passes it as
+	 * `reasoning` (SimpleStreamOptions); it is normalized to
+	 * `reasoningEffort` before request params are built (see
+	 * `resolveReasoningEffort`).
+	 */
+	reasoning?: ThinkingLevel;
 }
 
 // ── Retry configuration (authoritative, imported by index.ts) ──────────────
 
-/** Total time budget for chat completion retries. */
+/** Upper bound on the whole retry backoff sequence, in seconds — see
+ *  {@linkcode DEFAULT_MAX_RETRIES} for how many attempts fit inside it. It
+ *  bounds *sleeping* only: request time is not counted. */
 export const DEFAULT_RETRY_BUDGET_SEC = 120;
-/** Max retries to fit within the budget, assuming SDK exponential backoff (0.5, 1, 2, 4, 8...). */
+/** Max retries that fit inside {@linkcode DEFAULT_RETRY_BUDGET_SEC} given the
+ *  backoff in `getRetryDelayMs`: the first four steps are 0.5 + 1 + 2 + 4 =
+ *  7.5 s and every later step is capped at 8 s, so `4 + (budget − 7.5) / 8`
+ *  steps sum to the budget (18 steps ≈ 119.5 s). The 25 % jitter in
+ *  `getRetryDelayMs` only ever shortens a step, so the sum is an upper bound.
+ *  A server-supplied `Retry-After` is bounded separately (and rejected above
+ *  `maxRetryDelayMs`), so it does not extend this sequence. */
 export const DEFAULT_MAX_RETRIES =
 	Math.floor((DEFAULT_RETRY_BUDGET_SEC - 7.5) / 8) + 4;
 /** Max delay for a single retry attempt (caps Retry-After headers). */
 export const DEFAULT_MAX_RETRY_DELAY_SEC = 60;
+/** {@linkcode DEFAULT_MAX_RETRY_DELAY_SEC} in ms — default cap for `options.maxRetryDelayMs`. */
+export const DEFAULT_MAX_RETRY_DELAY_MS = DEFAULT_MAX_RETRY_DELAY_SEC * 1000;
 
 // ── Lemonade error types ────────────────────────────────────────────────────
 
@@ -91,9 +116,12 @@ function formatLemonadeError(err: LemonadeErrorShape): string {
  * the expected `choices` array.
  * NOTE: In practice the OpenAI SDK throws APIError before yielding, so
  * the real error formatting happens in the catch block below. This path
- * is kept as a defensive fallback.
+ * is kept as a defensive fallback in case a future SDK version stops
+ * throwing on `data.error` — and is exported so the detection itself stays
+ * covered by a unit test even though the branch it guards is unreachable
+ * today.
  */
-function isLemonadeErrorChunk(
+export function isLemonadeErrorChunk(
 	chunk: unknown,
 ): chunk is { error: LemonadeErrorShape } {
 	if (typeof chunk !== "object" || chunk === null) return false;
@@ -142,12 +170,15 @@ function isRetryableError(err: LemonadeErrorShape): boolean {
 
 const HF_HUB_PREFIX_RE = /^\/.*\/huggingface\/hub\//;
 
-/** Exponential backoff with jitter, matching provider-retry.ts. */
-function getRetryDelayMs(retryIndex: number): number {
+/** Exponential backoff with jitter, matching provider-retry.ts, capped per step. */
+function getRetryDelayMs(
+	retryIndex: number,
+	maxRetryDelayMs: number = DEFAULT_MAX_RETRY_DELAY_MS,
+): number {
 	const exponentialDelay = Math.min(0.5 * 2 ** retryIndex, 8) * 1000;
 	return Math.min(
 		exponentialDelay * (1 - Math.random() * 0.25),
-		DEFAULT_MAX_RETRY_DELAY_SEC * 1000,
+		Math.max(0, maxRetryDelayMs),
 	);
 }
 
@@ -173,23 +204,194 @@ function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
+/**
+ * The part of the OpenAI SDK error surface this fork needs for HTTP-level
+ * retry: the status and the response headers (`retry-after`). The SDK's own
+ * retry timer ignores `AbortSignal`, which is why requests are issued with
+ * `maxRetries: 0` and wrapped by {@link retryProviderRequest} instead.
+ */
+interface ProviderHttpError extends Error {
+	status: number | undefined;
+	headers: Headers | undefined;
+}
+
+function isProviderHttpError(error: unknown): error is ProviderHttpError {
+	if (
+		!(error instanceof Error) ||
+		!("status" in error) ||
+		!("headers" in error)
+	) {
+		return false;
+	}
+	const httpError = error as ProviderHttpError;
+	return (
+		(httpError.status === undefined || typeof httpError.status === "number") &&
+		(httpError.headers === undefined || httpError.headers instanceof Headers)
+	);
+}
+
+/**
+ * Retryability of the HTTP response itself, mirroring the pinned OpenAI SDK
+ * policy (same rules as pi-ai's `utils/provider-retry.ts`, which is not
+ * reachable from the package exports map — review when either is upgraded).
+ * `x-should-retry` wins over the status table; a missing status means the
+ * request never got a response (connection error), which is retryable.
+ *
+ * SSE-embedded Lemonade errors are thrown while *iterating* the stream, so
+ * they never reach this predicate — they are judged by `isRetryableStreamError`
+ * in the stream loop. Each failure is retried by at most one layer: an error
+ * with an HTTP status is retried here and is rejected by the stream predicate
+ * (see the narrowed `isRetryable` in `stream`), while status-less
+ * SSE-embedded errors never reach this predicate.
+ */
+function isRetryableHttpError(error: ProviderHttpError): boolean {
+	const shouldRetry = error.headers?.get("x-should-retry");
+	if (shouldRetry === "true") return true;
+	if (shouldRetry === "false") return false;
+	if (error.status === undefined) return true;
+	return (
+		error.status === 408 ||
+		error.status === 409 ||
+		error.status === 429 ||
+		error.status >= 500
+	);
+}
+
+/**
+ * A server-requested delay above `maxRetryDelayMs` fails instead of sleeping:
+ * a backend asking for ten minutes would hold the whole agent turn open
+ * (pi-ai parity).
+ */
+function validateServerRetryDelayMs(
+	delayMs: number,
+	maxRetryDelayMs: number | undefined,
+	providerErrorMessage: string,
+): number {
+	const maxDelayMs = maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS;
+	if (maxDelayMs > 0 && delayMs > maxDelayMs) {
+		throw new Error(
+			`Server requested ${Math.ceil(delayMs / 1000)}s retry delay (max: ${Math.ceil(maxDelayMs / 1000)}s). ${providerErrorMessage}`,
+		);
+	}
+	return delayMs;
+}
+
+/**
+ * `retry-after-ms` → `retry-after` (seconds or HTTP date) → exponential
+ * backoff, all capped by `maxRetryDelayMs`.
+ */
+function getHttpRetryDelayMs(
+	error: ProviderHttpError,
+	retryIndex: number,
+	maxRetryDelayMs: number | undefined,
+): number {
+	const retryAfterMs = error.headers?.get("retry-after-ms");
+	if (retryAfterMs) {
+		const value = Number.parseFloat(retryAfterMs);
+		if (!Number.isNaN(value)) {
+			return validateServerRetryDelayMs(
+				value,
+				maxRetryDelayMs,
+				error.message,
+			);
+		}
+	}
+
+	const retryAfter = error.headers?.get("retry-after");
+	if (retryAfter) {
+		const seconds = Number.parseFloat(retryAfter);
+		let delayMs = Number.isNaN(seconds)
+			? Date.parse(retryAfter) - Date.now()
+			: seconds * 1000;
+		// A value that is neither seconds nor an HTTP date parses to NaN;
+		// left as-is it becomes a 0 ms delay (setTimeout(NaN) fires
+		// immediately), so fall back to the exponential schedule.
+		if (Number.isNaN(delayMs)) delayMs = getRetryDelayMs(retryIndex, maxRetryDelayMs);
+		return validateServerRetryDelayMs(delayMs, maxRetryDelayMs, error.message);
+	}
+
+	return getRetryDelayMs(retryIndex, maxRetryDelayMs);
+}
+
+interface HttpRetryOptions {
+	maxRetries?: number;
+	maxRetryDelayMs?: number;
+	signal?: AbortSignal;
+}
+
+/**
+ * HTTP-level retry for the initial request — the equivalent of upstream pi's
+ * `retryProviderRequest` (`@earendil-works/pi-ai/utils/provider-retry` is not
+ * exported from the package, so it is reproduced here). Without it, a plain
+ * `429`/`5xx` JSON error (no Lemonade `error.status_code` in the body) was
+ * fatal and `Retry-After` was ignored, because the SDK client is created with
+ * `maxRetries: 0`.
+ */
+async function retryProviderRequest<T>(
+	request: () => Promise<T>,
+	options?: HttpRetryOptions,
+): Promise<T> {
+	const maxRetries = options?.maxRetries ?? 0;
+	let retriesRemaining = maxRetries;
+
+	for (;;) {
+		try {
+			// Each retry is a fresh SDK request, so X-Stainless-Retry-Count stays zero.
+			return await request();
+		} catch (error) {
+			if (options?.signal?.aborted) throw error;
+			if (
+				retriesRemaining <= 0 ||
+				!isProviderHttpError(error) ||
+				!isRetryableHttpError(error)
+			) {
+				throw error;
+			}
+			const retryIndex = maxRetries - retriesRemaining;
+			retriesRemaining--;
+			await abortableSleep(
+				getHttpRetryDelayMs(error, retryIndex, options?.maxRetryDelayMs),
+				options?.signal,
+			);
+		}
+	}
+}
+
 interface StreamRetryOptions {
 	maxRetries?: number;
+	/** Upper bound for a single backoff step (pi-ai `StreamOptions.maxRetryDelayMs`). */
+	maxRetryDelayMs?: number;
 	signal?: AbortSignal;
+	/**
+	 * Retryability predicate for the thrown error. Defaults to
+	 * {@link isRetryableStreamError}; `stream` narrows it so an attempt that has
+	 * already streamed content is never retried.
+	 */
+	isRetryable?: (error: unknown) => boolean;
+}
+
+/**
+ * Default retryability for the loop: the Lemonade error shape the SDK nests
+ * under `error.error` (SSE error events and Lemonade JSON error bodies).
+ */
+function isRetryableStreamError(error: unknown): boolean {
+	const lemonadeError = (error as { error?: LemonadeErrorShape })?.error;
+	return Boolean(lemonadeError && isRetryableError(lemonadeError));
 }
 
 /**
  * Retry a streaming loop on mid-stream Lemonade errors.
  *
- * The `streamFn` is called in a loop. If it throws a Lemonade error that is
- * retryable, we back off and retry. Non-retryable errors and exhausted retries
- * propagate the error.
+ * The `streamFn` is called in a loop. If it throws a retryable error, we back
+ * off and retry. Non-retryable errors and exhausted retries propagate the
+ * error.
  */
 async function retryStreamLoop<T>(
 	streamFn: () => Promise<T>,
 	options?: StreamRetryOptions,
 ): Promise<T> {
 	const maxRetries = options?.maxRetries ?? 0;
+	const isRetryable = options?.isRetryable ?? isRetryableStreamError;
 	let retriesRemaining = maxRetries;
 
 	for (;;) {
@@ -199,13 +401,11 @@ async function retryStreamLoop<T>(
 			if (options?.signal?.aborted) throw error;
 			if (retriesRemaining <= 0) throw error;
 
-			// Check for Lemonade error shape in the thrown error
-			const lemonadeError = (error as { error?: LemonadeErrorShape })?.error;
-			if (lemonadeError && isRetryableError(lemonadeError)) {
+			if (isRetryable(error)) {
 				const retryIndex = maxRetries - retriesRemaining;
 				retriesRemaining--;
 				await abortableSleep(
-					getRetryDelayMs(retryIndex),
+					getRetryDelayMs(retryIndex, options?.maxRetryDelayMs),
 					options?.signal,
 				);
 				continue;
@@ -218,7 +418,48 @@ async function retryStreamLoop<T>(
 
 // ── Compat resolution ───────────────────────────────────────────────────────
 
-interface ResolvedCompat {
+/** The `Model<"openai-completions">` compat shape (the `models.json` surface). */
+type CompatInput = NonNullable<Model<"openai-completions">["compat"]>;
+
+/**
+ * Compat keys this fork resolves to a concrete value. Every *other* compat key
+ * is passed through untouched — see `ResolvedCompat`.
+ */
+type ResolvedCompatKeys =
+	| "supportsStore"
+	| "supportsDeveloperRole"
+	| "supportsReasoningEffort"
+	| "supportsUsageInStreaming"
+	| "supportsFinishReason"
+	| "maxTokensField"
+	| "requiresToolResultName"
+	| "requiresAssistantAfterToolResult"
+	| "requiresThinkingAsText"
+	| "requiresReasoningContentOnAssistantMessages"
+	| "thinkingFormat"
+	| "supportsStrictMode"
+	| "chatTemplateKwargs"
+	| "chatTemplateArgs";
+
+/**
+ * The compat object handed to `convertMessages` and `buildParams`.
+ *
+ * It is `CompatInput` minus the keys this fork defaults explicitly, so every
+ * other compat flag a user sets in `models.json`
+ * (`supportsThinkingTokenBudget`, `deferredToolsMode`, `supportsOpenAIGrammarTools`,
+ * `cacheControlFormat`, `sendSessionAffinityHeaders`, …) survives resolution
+ * instead of being silently dropped. pi-ai resolves 24 keys from its own
+ * `getCompat` (with `baseUrl` auto-detection); this fork whitelisted 14, which
+ * meant anything outside the list never reached `convertMessages` — the
+ * resolved object is passed to it in place of `model.compat`.
+ *
+ * Note: passing a key through makes it visible to the request builder, not
+ * necessarily acted on — the request-body features this fork never implemented
+ * (cloud-only routing, prompt-cache retention, session-affinity headers,
+ * `thinking_token_budget`) are still not emitted, as documented in the
+ * lemonade-streaming skill.
+ */
+type ResolvedCompat = Omit<CompatInput, ResolvedCompatKeys> & {
 	supportsStore: boolean;
 	supportsDeveloperRole: boolean;
 	supportsReasoningEffort: boolean;
@@ -231,16 +472,25 @@ interface ResolvedCompat {
 	requiresReasoningContentOnAssistantMessages: boolean;
 	thinkingFormat: string;
 	supportsStrictMode: boolean;
-}
+	chatTemplateKwargs?: Record<string, ChatTemplateKwargValue>;
+	chatTemplateArgs?: Record<string, ChatTemplateKwargValue>;
+};
 
+/**
+ * Resolve `model.compat` to concrete values. Lemonade models always set their
+ * compat explicitly (`toModel`), so pi-ai's `baseUrl` auto-detection is not
+ * reproduced here — only the defaults for keys Lemonade servers do not need to
+ * opt into. Unknown/unlisted keys pass through unchanged.
+ */
 function getCompat(model: Model<"openai-completions">): ResolvedCompat {
 	const compat = model.compat;
 	return {
+		...compat,
 		supportsStore: compat?.supportsStore ?? true,
 		supportsDeveloperRole: compat?.supportsDeveloperRole ?? true,
 		supportsReasoningEffort: compat?.supportsReasoningEffort ?? true,
 		supportsUsageInStreaming: compat?.supportsUsageInStreaming ?? true,
-		supportsFinishReason: true,
+		supportsFinishReason: compat?.supportsFinishReason ?? true,
 		maxTokensField: compat?.maxTokensField ?? "max_completion_tokens",
 		requiresToolResultName: compat?.requiresToolResultName ?? false,
 		requiresAssistantAfterToolResult:
@@ -250,6 +500,8 @@ function getCompat(model: Model<"openai-completions">): ResolvedCompat {
 			compat?.requiresReasoningContentOnAssistantMessages ?? false,
 		thinkingFormat: compat?.thinkingFormat ?? "openai",
 		supportsStrictMode: compat?.supportsStrictMode ?? true,
+		chatTemplateKwargs: compat?.chatTemplateKwargs,
+		chatTemplateArgs: compat?.chatTemplateArgs,
 	};
 }
 
@@ -304,9 +556,300 @@ function createClient(
 
 // ── Param building ──────────────────────────────────────────────────────────
 
+/**
+ * Resolve the effective reasoning effort for request building.
+ *
+ * The TUI agent loop passes the selected thinking level as
+ * `options.reasoning` (SimpleStreamOptions) — NOT as `reasoningEffort`.
+ * pi-ai's built-in openai-completions `streamSimple` clamps it to a level
+ * the model supports and re-passes it as `reasoningEffort` before calling
+ * the internal stream. This fork's `streamSimple` delegates straight to
+ * `stream`, so the same normalization must happen here; otherwise
+ * `applyThinkingParams` sees `reasoningEffort === undefined` and
+ * `qwen-chat-template` sends `enable_thinking: false` even with thinking
+ * enabled.
+ */
+function resolveReasoningEffort(
+	model: Model<"openai-completions">,
+	options: LemonadeCompletionsOptions | undefined,
+): ThinkingLevel | undefined {
+	if (options?.reasoningEffort !== undefined) return options.reasoningEffort;
+	const reasoning = options?.reasoning;
+	if (!reasoning) return undefined;
+	const clamped = clampThinkingLevel(model, reasoning);
+	return clamped === "off" ? undefined : clamped;
+}
+
+/**
+ * Apply thinking/reasoning request parameters based on
+ * `compat.thinkingFormat`. Mirrors pi-ai openai-completions so that
+ * models.json `modelOverrides` (thinkingFormat, chatTemplateKwargs,
+ * thinkingLevelMap) behave identically to the built-in provider.
+ */
+// pi-lens-ignore: high-complexity,high-fan-out
+function applyThinkingParams(
+	params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
+	model: Model<"openai-completions">,
+	options: OpenAICompletionsOptions | undefined,
+	compat: ResolvedCompat,
+): void {
+	if (!model.reasoning) return;
+	const effort = resolveReasoningEffort(model, options);
+	const enabled = effort !== undefined;
+
+	if (compat.thinkingFormat === "zai") {
+		// pi-lens-ignore: no-as-any,no-any-type
+		const zaiParams = params as any;
+		zaiParams.thinking = effort
+			? { type: "enabled", clear_thinking: false }
+			: { type: "disabled" };
+		if (effort && compat.supportsReasoningEffort) {
+			const mapped = model.thinkingLevelMap?.[effort];
+			const value = mapped === undefined ? effort : mapped;
+			if (typeof value === "string") zaiParams.reasoning_effort = value;
+		}
+		return;
+	}
+
+	if (compat.thinkingFormat === "qwen") {
+		// pi-lens-ignore: no-as-any,no-any-type
+		const qwenParams = params as any;
+		qwenParams.enable_thinking = enabled;
+		if (effort && compat.supportsReasoningEffort) {
+			const value = model.thinkingLevelMap?.[effort] ?? effort;
+			if (typeof value === "string") qwenParams.reasoning_effort = value;
+		}
+		return;
+	}
+
+	if (compat.thinkingFormat === "qwen-chat-template") {
+		// pi-lens-ignore: no-as-any,no-any-type
+		(params as any).chat_template_kwargs = {
+			enable_thinking: enabled,
+			preserve_thinking: true,
+		};
+		return;
+	}
+
+	if (compat.thinkingFormat === "chat-template") {
+		const kwargs = buildChatTemplateValues(
+			model,
+			options,
+			compat.chatTemplateKwargs,
+		);
+		if (kwargs) {
+			// pi-lens-ignore: no-as-any,no-any-type
+			(params as any).chat_template_kwargs = kwargs;
+		}
+		return;
+	}
+
+	if (compat.thinkingFormat === "baseten") {
+		// pi-lens-ignore: no-as-any,no-any-type
+		const basetenParams = params as any;
+		const args = buildChatTemplateValues(
+			model,
+			options,
+			compat.chatTemplateArgs,
+		);
+		if (args) basetenParams.chat_template_args = args;
+		if (compat.supportsReasoningEffort) {
+			const mapped = effort
+				? model.thinkingLevelMap?.[effort]
+				: model.thinkingLevelMap?.off;
+			const value = mapped === undefined ? effort : mapped;
+			if (typeof value === "string") basetenParams.reasoning_effort = value;
+		}
+		return;
+	}
+
+	if (compat.thinkingFormat === "deepseek") {
+		// pi-lens-ignore: no-as-any,no-any-type
+		const deepseekParams = params as any;
+		if (effort) {
+			deepseekParams.thinking = { type: "enabled" };
+		} else if (model.thinkingLevelMap?.off !== null) {
+			deepseekParams.thinking = { type: "disabled" };
+		}
+		if (effort && compat.supportsReasoningEffort) {
+			deepseekParams.reasoning_effort =
+				model.thinkingLevelMap?.[effort] ?? effort;
+		}
+		return;
+	}
+
+	if (compat.thinkingFormat === "openrouter") {
+		// pi-lens-ignore: no-as-any,no-any-type
+		const openRouterParams = params as any;
+		if (effort) {
+			openRouterParams.reasoning = {
+				effort: model.thinkingLevelMap?.[effort] ?? effort,
+			};
+		} else if (model.thinkingLevelMap?.off !== null) {
+			openRouterParams.reasoning = {
+				effort: model.thinkingLevelMap?.off ?? "none",
+			};
+		}
+		return;
+	}
+
+	if (compat.thinkingFormat === "ant-ling") {
+		if (effort) {
+			const value = model.thinkingLevelMap?.[effort];
+			if (typeof value === "string") {
+				// pi-lens-ignore: no-as-any,no-any-type
+				(params as any).reasoning = { effort: value };
+			}
+		}
+		return;
+	}
+
+	if (compat.thinkingFormat === "together") {
+		// pi-lens-ignore: no-as-any,no-any-type
+		const togetherParams = params as any;
+		togetherParams.reasoning = { enabled };
+		if (effort && compat.supportsReasoningEffort) {
+			togetherParams.reasoning_effort =
+				model.thinkingLevelMap?.[effort] ?? effort;
+		}
+		return;
+	}
+
+	if (compat.thinkingFormat === "string-thinking") {
+		// pi-lens-ignore: no-as-any,no-any-type
+		const stringThinkingParams = params as any;
+		if (effort) {
+			stringThinkingParams.thinking =
+				model.thinkingLevelMap?.[effort] ?? effort;
+		} else if (model.thinkingLevelMap?.off !== null) {
+			stringThinkingParams.thinking =
+				model.thinkingLevelMap?.off ?? "none";
+		}
+		return;
+	}
+
+	// "openai" (default): OpenAI-style reasoning_effort
+	if (effort && compat.supportsReasoningEffort) {
+		// pi-lens-ignore: no-as-any,no-any-type
+		(params as any).reasoning_effort =
+			model.thinkingLevelMap?.[effort] ?? effort;
+	} else if (!effort && compat.supportsReasoningEffort) {
+		const offValue = model.thinkingLevelMap?.off;
+		if (typeof offValue === "string") {
+			// pi-lens-ignore: no-as-any,no-any-type
+			(params as any).reasoning_effort = offValue;
+		}
+	}
+}
+
+/**
+ * Resolve `chatTemplateKwargs`/`chatTemplateArgs` entries, expanding
+ * `{ "$var": "thinking.enabled" | "thinking.effort" }` placeholders
+ * against the current thinking state. Mirrors pi-ai.
+ */
+function buildChatTemplateValues(
+	model: Model<"openai-completions">,
+	options: OpenAICompletionsOptions | undefined,
+	values: Record<string, ChatTemplateKwargValue> | undefined,
+): Record<string, ChatTemplateKwargValue> | undefined {
+	if (!values) return undefined;
+	const resolved: Record<string, ChatTemplateKwargValue> = {};
+	for (const [key, value] of Object.entries(values)) {
+		const entry = resolveChatTemplateKwargValue(model, options, value);
+		if (entry !== undefined) resolved[key] = entry;
+	}
+	return Object.keys(resolved).length > 0 ? resolved : undefined;
+}
+
+/**
+ * Resolve a single `chatTemplateKwargs`/`chatTemplateArgs` value.
+ * Literals pass through; `{ "$var": ... }` placeholders expand against
+ * the current thinking state, with `omitWhenOff` dropping the key when
+ * thinking is off. Mirrors pi-ai.
+ */
+function resolveChatTemplateKwargValue(
+	model: Model<"openai-completions">,
+	options: OpenAICompletionsOptions | undefined,
+	value: ChatTemplateKwargValue,
+): ChatTemplateKwargValue | undefined {
+	if (typeof value !== "object" || value === null) return value;
+	const effort = resolveReasoningEffort(model, options);
+	if (!effort && value.omitWhenOff) return undefined;
+	if (value.$var === "thinking.enabled") return effort !== undefined;
+	const mapped = effort
+		? model.thinkingLevelMap?.[effort]
+		: model.thinkingLevelMap?.off;
+	if (mapped === undefined) return effort;
+	return typeof mapped === "string" ? mapped : undefined;
+}
+
+/**
+ * pi-ai's fixed prompt reserve (`CONTEXT_SAFETY_TOKENS` in
+ * `pi-ai/api/simple-options`), used as the reserve for large context windows.
+ */
+const PI_CONTEXT_SAFETY_TOKENS = 4096;
+/** Lower bound for the prompt reserve on small local context windows. */
+const LOCAL_MIN_RESERVE_TOKENS = 512;
+/** Floor for the output budget when the prompt already fills the window. */
+const LOCAL_MIN_OUTPUT_TOKENS = 256;
+
+/**
+ * Tokens to leave free for the prompt: pi-ai's 4096 for large windows, scaled
+ * down (never below 512) for the small windows local servers run.
+ */
+function localContextReserveTokens(contextWindow: number): number {
+	return Math.min(
+		PI_CONTEXT_SAFETY_TOKENS,
+		Math.max(LOCAL_MIN_RESERVE_TOKENS, Math.floor(contextWindow / 8)),
+	);
+}
+
+/**
+ * Clamp an output budget for a local server.
+ *
+ * pi-ai's `clampMaxTokensToContext()` reserves a fixed 4096 tokens between the
+ * estimated prompt and the output budget, and floors the result at its
+ * `MIN_MAX_TOKENS` of 1. That is right for cloud models but lethal at the
+ * context window sizes Lemonade serves: a 4096-token model gets
+ * `max_tokens: 1` and answers with a single token. Here the reserve scales with
+ * the window — `min(4096, max(512, ctx / 8))` — so behaviour matches upstream
+ * from 32768 tokens up, while small models keep a usable budget. A prompt that
+ * already fills the window still gets `LOCAL_MIN_OUTPUT_TOKENS` rather than 1:
+ * local servers clamp generation to their own `n_ctx`, and one token is never a
+ * useful answer.
+ *
+ * The token estimate itself stays pi-ai's — `estimateContextTokens()` is not
+ * exported — by inflating the window by the difference between pi-ai's fixed
+ * reserve and ours, so its arithmetic evaluates `ctx - estimate - reserve`.
+ */
+function clampMaxTokensForLocalContext(
+	model: Model<"openai-completions">,
+	context: ProviderContext,
+	maxTokens: number | undefined,
+): number {
+	// No cap requested (no `options.maxTokens`, no model `maxTokens`).
+	if (!maxTokens) return 0;
+	// Unknown context window: trust whatever cap the model advertises.
+	if (model.contextWindow <= 0) return maxTokens;
+	const reserve = localContextReserveTokens(model.contextWindow);
+	const clamped = clampMaxTokensToContext(
+		{
+			...model,
+			contextWindow:
+				model.contextWindow + (PI_CONTEXT_SAFETY_TOKENS - reserve),
+		},
+		context,
+		maxTokens,
+	);
+	return Math.min(
+		maxTokens,
+		Math.max(Math.min(maxTokens, LOCAL_MIN_OUTPUT_TOKENS), clamped),
+	);
+}
+
 function buildParams(
 	model: Model<"openai-completions">,
-	context: Context,
+	context: ProviderContext,
 	options?: OpenAICompletionsOptions,
 	compat: ResolvedCompat = getCompat(model),
 ): OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming {
@@ -328,12 +871,27 @@ function buildParams(
 		params.store = false;
 	}
 
-	if (options?.maxTokens) {
+	// `maxTokens` is derived from the model, not only from the request: pi-ai
+	// fills `options.maxTokens` from `model.maxTokens` in `buildBaseOptions`
+	// (`pi-ai/api/simple-options`), which the built-in `streamSimple` calls but
+	// this fork's does not (it delegates straight to `stream`). The agent loop
+	// never sets `options.maxTokens` for ordinary turns — only compaction does
+	// — so deriving it here is what makes `models.json` `modelOverrides.maxTokens`
+	// (and the discovered `maxTokens`) reach the wire. The budget is clamped to
+	// the tokens still available in `model.contextWindow`, with the reserve
+	// scaled to the window instead of pi-ai's fixed 4096 — see
+	// `clampMaxTokensForLocalContext`.
+	const maxTokens = clampMaxTokensForLocalContext(
+		model,
+		context,
+		options?.maxTokens ?? model.maxTokens,
+	);
+	if (maxTokens) {
 		if (compat.maxTokensField === "max_tokens") {
 			// pi-lens-ignore: no-as-any,no-any-type
-			(params as any).max_tokens = options.maxTokens;
+			(params as any).max_tokens = maxTokens;
 		} else {
-			params.max_completion_tokens = options.maxTokens;
+			params.max_completion_tokens = maxTokens;
 		}
 	}
 
@@ -358,14 +916,22 @@ function buildParams(
 		params.tool_choice = options.toolChoice;
 	}
 
-	// reasoning_effort (OpenAI-style, the default for Lemonade)
-	if (
-		options?.reasoningEffort &&
-		model.reasoning &&
-		compat.supportsReasoningEffort
-	) {
-		// pi-lens-ignore: no-as-any,no-any-type
-		(params as any).reasoning_effort = options.reasoningEffort;
+	// Thinking/reasoning request parameters — mirrors pi-ai's
+	// openai-completions thinkingFormat handling so models.json
+	// modelOverrides (thinkingFormat, chatTemplateKwargs, thinkingLevelMap)
+	// behave the same as the built-in provider.
+	applyThinkingParams(params, model, options, compat);
+
+	// Last so custom keys override the named request fields.
+	// `model.samplingParams` (models.json `modelOverrides.samplingParams`) is
+	// merged over by the per-request value — pi-ai does this merge in
+	// `buildBaseOptions`, which this fork bypasses, so it happens here instead.
+	const samplingParams =
+		model.samplingParams || options?.samplingParams
+			? { ...model.samplingParams, ...options?.samplingParams }
+			: undefined;
+	if (samplingParams) {
+		Object.assign(params, samplingParams);
 	}
 
 	return params;
@@ -373,27 +939,38 @@ function buildParams(
 
 // ── Usage parsing ───────────────────────────────────────────────────────────
 
-function parseChunkUsage(rawUsage: {
-	prompt_tokens?: number;
-	completion_tokens?: number;
-	prompt_cache_hit_tokens?: number;
-	prompt_tokens_details?: {
+function parseChunkUsage(
+	rawUsage: {
+		prompt_tokens?: number;
+		completion_tokens?: number;
 		cached_tokens?: number;
-		cache_write_tokens?: number;
-	};
-	completion_tokens_details?: { reasoning_tokens?: number };
-}): AssistantMessage["usage"] {
+		prompt_cache_hit_tokens?: number;
+		prompt_tokens_details?: {
+			cached_tokens?: number;
+			cache_write_tokens?: number;
+		};
+		completion_tokens_details?: { reasoning_tokens?: number };
+	},
+	model: Model<"openai-completions">,
+): AssistantMessage["usage"] {
 	const promptTokens = rawUsage.prompt_tokens || 0;
+	// Providers disagree about where cache reads are reported: OpenAI nests
+	// `prompt_tokens_details.cached_tokens`, DeepSeek uses
+	// `prompt_cache_hit_tokens`, and Ollama/Lemonade-style backends (like Kimi)
+	// put `cached_tokens` at the top level of the usage object. Cache writes stay
+	// separate and are never subtracted from the read count. Mirrors upstream
+	// openai-completions.ts.
 	const cacheReadTokens =
 		rawUsage.prompt_tokens_details?.cached_tokens ??
 		rawUsage.prompt_cache_hit_tokens ??
+		rawUsage.cached_tokens ??
 		0;
 	const cacheWriteTokens =
 		rawUsage.prompt_tokens_details?.cache_write_tokens || 0;
 	const input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
 	const outputTokens = rawUsage.completion_tokens || 0;
 
-	return {
+	const usage: AssistantMessage["usage"] = {
 		input,
 		output: outputTokens,
 		cacheRead: cacheReadTokens,
@@ -402,6 +979,12 @@ function parseChunkUsage(rawUsage: {
 		totalTokens: input + outputTokens + cacheReadTokens + cacheWriteTokens,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
+	// pi prices messages through calculateCost (per-million rates from
+	// `model.cost`, tiers included). Skipping it left every Lemonade message
+	// reporting zero cost even when pricing was configured in models.json.
+	// Local models default to all-zero rates, so this stays exactly zero there.
+	calculateCost(model, usage);
+	return usage;
 }
 
 function mapStopReason(
@@ -451,15 +1034,176 @@ type StreamingBlock = TextContent | ThinkingContent | StreamingToolCallBlock;
  * Lemonade-specific error events mid-stream and retries on 429 / retryable
  * errors per lemonade-error-shapes.md.
  */
+/**
+ * Appended to the error message when a retryable error arrives after content
+ * has already streamed (see the retry guard in `stream`).
+ */
+const RETRY_SUPPRESSED_NOTE = " (retryable, but output had already started — not retried)";
+
+// ── pi ≥ 0.86 transcript normalization ─────────────────────────────────────
+
+/**
+ * pi ≥ 0.86 hands providers a normalized *transcript context* instead of the
+ * legacy `Context`: the system prompt and tool declarations are no longer on
+ * the context but are carried by system messages inside `messages` (the
+ * leading system message holds the base prompt in `content`, named prompt
+ * sections in `sections`, and the initial tools in `toolsAdded`; later system
+ * messages append prompt text, replace or remove sections, and add or remove
+ * tools). pi ≤ 0.85 still sends the legacy shape (`systemPrompt`/`tools` on
+ * the context, no system messages).
+ *
+ * The pi-ai `convertMessages` this fork reuses is generation-dependent:
+ * 0.84/0.85 read `context.systemPrompt` and silently drop `system`-role
+ * messages in the list, while 0.86 reads the system messages in the list and
+ * ignores `context.systemPrompt`. The fold below emits *both* encodings —
+ * `systemPrompt` on the context **and** a synthetic leading system message —
+ * so exactly one system prompt reaches the wire on any pi ≥ 0.83 runtime
+ * with the 0.86.x local pi-ai this package pins. The current tool set
+ * (replaying `toolsAdded`/`toolsRemoved` in transcript order) goes on
+ * `context.tools`, which this fork's `buildParams` reads directly.
+ */
+
+/**
+ * What the fork actually receives: pi ≥ 0.86 passes the branded
+ * `TranscriptContext` (prompt/tools carried by the transcript's system
+ * messages), pi ≤ 0.85 passes the legacy context with `systemPrompt`/`tools`
+ * on it. The intersection covers both, and the brand survives the fold
+ * below, so the result stays a valid `TranscriptContext` for pi-ai's 0.86
+ * `convertMessages` / `clampMaxTokensToContext`.
+ */
+type ProviderContext = TranscriptContext & {
+	systemPrompt?: string;
+	tools?: Tool[];
+};
+
+/** A `system`-role message as pi ≥ 0.86 carries it in the transcript. */
+interface TranscriptSystemMessage {
+	role: "system";
+	content: string | TextContent[];
+	sections?: Record<string, string | null>;
+	toolsAdded?: Tool[];
+	toolsRemoved?: { name: string }[];
+	timestamp?: number;
+}
+
+/**
+ * Content text of one system message (mirrors pi-ai's `contentText` join
+ * semantics). Sections are handled separately by the replay in
+ * {@linkcode normalizeTranscriptContext}: the merged prompt carries the
+ * *final* section state, not each message's own.
+ */
+function systemMessageContent(message: TranscriptSystemMessage): string {
+	return typeof message.content === "string"
+		? message.content
+		: message.content
+				.filter((block) => block.type === "text")
+				.map((block) => block.text)
+				.join("\n");
+}
+
+/**
+ * Fold any pi ≥ 0.83 context into the dual-encoded shape described in the
+ * section header: one `systemPrompt` (all system-message content replayed in
+ * transcript order, then the *final* state of their named sections —
+ * replaced by name, `null` removes — matching pi-ai's own
+ * `getCurrentSystemMessage`/`getSystemMessageText` replay), a synthetic
+ * leading system message carrying the same text, the current `tools` set on
+ * the context, and `messages` without system entries.
+ *
+ * Contexts with no prompt and no system messages pass through unchanged,
+ * and an already-folded context (single leading system message mirroring
+ * `systemPrompt`, no sections or tool deltas) is returned unchanged — the
+ * fold is idempotent, so it is safe to run on every request. A genuine
+ * pi ≥ 0.86 transcript never has `context.systemPrompt` set, so the
+ * idempotency guard cannot misfire on real input.
+ */
+export function normalizeTranscriptContext(context: ProviderContext): ProviderContext {
+	const messages = context.messages;
+	const systemMessages = messages.filter((message) => message.role === "system");
+
+	// Nothing to fold: no system messages and no prompt to re-encode.
+	if (
+		systemMessages.length === 0 &&
+		(context.systemPrompt === undefined || context.systemPrompt.length === 0)
+	) {
+		return context;
+	}
+
+	// Idempotency guard (see above).
+	const first = systemMessages[0];
+	if (
+		systemMessages.length === 1 &&
+		messages[0] === first &&
+		typeof first.content === "string" &&
+		first.content === context.systemPrompt &&
+		first.sections === undefined &&
+		first.toolsAdded === undefined &&
+		first.toolsRemoved === undefined
+	) {
+		return context;
+	}
+
+	const contentParts: string[] = [];
+	const sections = new Map<string, string>();
+	const tools = new Map<string, Tool>();
+	for (const message of systemMessages) {
+		const content = systemMessageContent(message);
+		if (content.length > 0) contentParts.push(content);
+		for (const [name, value] of Object.entries(message.sections ?? {})) {
+			if (value === null) sections.delete(name);
+			else sections.set(name, value);
+		}
+		for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
+		for (const tool of message.toolsAdded ?? []) tools.set(tool.name, tool);
+	}
+
+	const promptParts = [
+		context.systemPrompt,
+		...contentParts,
+		...sections.values(),
+	].filter((part) => part !== undefined && part.length > 0);
+	const systemPrompt = promptParts.length > 0 ? promptParts.join("\n\n") : undefined;
+	return {
+		...context,
+		...(systemPrompt ? { systemPrompt } : {}),
+		...(tools.size > 0 ? { tools: [...tools.values()] } : {}),
+		messages: [
+			...(systemPrompt
+				? [{ role: "system" as const, content: systemPrompt, timestamp: 0 }]
+				: []),
+			...messages.filter((message) => message.role !== "system"),
+		],
+	};
+}
+
+/** Zeroed usage for a fresh attempt / a stream that never reported usage. */
+function emptyUsage(): AssistantMessage["usage"] {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
 export const stream: StreamFunction<
 	"openai-completions",
 	LemonadeCompletionsOptions
 	// pi-lens-ignore: high-complexity,high-fan-out
 > = (
 	model: Model<"openai-completions">,
-	context: Context,
+	context: ProviderContext,
 	options?: LemonadeCompletionsOptions,
 ): AssistantMessageEventStream => {
+	// Fold the context once per request: pi ≥ 0.86 sends a transcript context
+	// (prompt/tools carried by system messages in the transcript), pi ≤ 0.85
+	// sends the legacy `Context`. `buildParams` and pi-ai's `convertMessages`
+	// then see the same dual-encoded fields on every pi ≥ 0.83 (see the
+	// transcript normalization section above). No-op for prompt-less contexts.
+	context = normalizeTranscriptContext(context);
+
 	const eventStream = createAssistantMessageEventStream();
 
 	// `output` declared at this scope so the retry catch block can mutate it.
@@ -469,20 +1213,35 @@ export const stream: StreamFunction<
 		api: model.api,
 		provider: model.provider,
 		model: model.id,
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
+		usage: emptyUsage(),
 		stopReason: "pending",
 		timestamp: Date.now(),
 	};
 
+	// Emitted once per `stream()` call rather than once per attempt: a retry
+	// starts from a fresh message, but the consumer already has its placeholder.
+	let started = false;
+	// Set when a retryable error was not retried because content had already
+	// streamed, so the terminal error message can explain why.
+	let retrySuppressed = false;
+
 	// pi-lens-ignore: high-complexity,high-fan-out
 	const executeStream = async () => {
+		// `output` outlives a single attempt, so each attempt has to reset what
+		// the previous one accumulated: otherwise a retry appends its text to the
+		// partial message of the attempt that failed (both ended up in the final
+		// assistant message, with duplicate text_start/text_end events) and the
+		// failed attempt's usage/stopReason/responseId leak into the successful
+		// retry. Retries are additionally suppressed once any content has been
+		// emitted (see `retryStreamLoop` below), so nothing already shown to the
+		// consumer is ever discarded and re-sent.
+		output.content = [];
+		output.usage = emptyUsage();
+		output.stopReason = "pending";
+		output.errorMessage = undefined;
+		output.responseId = undefined;
+		output.responseModel = undefined;
+
 		const apiKey = getClientApiKey(
 			model.provider,
 			options?.apiKey,
@@ -509,15 +1268,25 @@ export const stream: StreamFunction<
 				nextParams as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming;
 		}
 
+		// The SDK's own retry timer ignores AbortSignal and cannot judge Lemonade
+		// error shapes, so requests go out with `maxRetries: 0`. HTTP-level retry
+		// (status table + `Retry-After`, abortible) happens in
+		// `retryProviderRequest`; SSE-embedded Lemonade errors are handled by
+		// `retryStreamLoop`, which only retries while nothing has streamed yet.
 		const requestOptions = {
 			...(options?.signal ? { signal: options.signal } : {}),
 			...(options?.timeoutMs === undefined ? {} : { timeout: options.timeoutMs }),
 			maxRetries: 0,
 		};
 
-		const { data: openaiStream, response } = await client.chat.completions
-			.create(params, requestOptions)
-			.withResponse();
+		const { data: openaiStream, response } = await retryProviderRequest(
+			() => client.chat.completions.create(params, requestOptions).withResponse(),
+			{
+				maxRetries: options?.maxRetries,
+				maxRetryDelayMs: options?.maxRetryDelayMs,
+				signal: options?.signal,
+			},
+		);
 
 		await options?.onResponse?.(
 			{
@@ -527,7 +1296,12 @@ export const stream: StreamFunction<
 			model,
 		);
 
-		eventStream.push({ type: "start", partial: output });
+		// Emitted once per call (see `started`): a retried attempt must not push a
+		// second `start` for the same assistant message.
+		if (!started) {
+			eventStream.push({ type: "start", partial: output });
+			started = true;
+		}
 
 		let textBlock: TextContent | null = null;
 		let thinkingBlock: ThinkingContent | null = null;
@@ -649,7 +1423,7 @@ export const stream: StreamFunction<
 			// On 429 / retryable errors, we throw to trigger retryStreamLoop.
 			if (isLemonadeErrorChunk(chunk)) {
 				const err = chunk.error;
-				if (isRetryableError(err)) {
+				if (isRetryableError(err) && output.content.length === 0) {
 					// Throw the error shape so retryStreamLoop can catch and retry.
 					const retryError = new Error(
 						`Lemonade mid-stream retryable error: ${err.message}` +
@@ -659,9 +1433,15 @@ export const stream: StreamFunction<
 					retryError.error = err;
 					throw retryError;
 				}
-				// Non-retryable error — terminate the stream with full error details.
+				// Non-retryable error — terminate the stream with full error
+				// details. Anything already streamed is kept: a retry would append
+				// its text under the partial answer the consumer is already
+				// rendering, so a mid-stream error after content is reported, not
+				// retried.
+				const partialNote =
+					output.content.length > 0 ? RETRY_SUPPRESSED_NOTE : "";
 				output.stopReason = "error";
-				output.errorMessage = formatLemonadeError(err);
+				output.errorMessage = `${formatLemonadeError(err)}${partialNote}`;
 				for (const block of blocks) finishBlock(block);
 				eventStream.push({ type: "error", reason: "error", error: output });
 				eventStream.end();
@@ -671,24 +1451,24 @@ export const stream: StreamFunction<
 			// Standard OpenAI chunk processing
 			const typedChunk = chunk as ChatCompletionChunk;
 
-            output.responseId ||= typedChunk.id;
-            if (
-                typeof typedChunk.model === "string" &&
-                typedChunk.model.length > 0 &&
-                typedChunk.model !== model.id
-            ) {
-                const serverModel = typedChunk.model;
-                // Lemonade may return the full GGUF cache path;
-                // strip `/*/huggingface/hub/` prefix for readability.
-                const match = serverModel.match(HF_HUB_PREFIX_RE);
-                const resolvedModel =
-                    match
-                        ? serverModel.slice((match.index ?? 0) + match[0].length)
-                        : serverModel;
-                output.responseModel ||= resolvedModel;
-            }
+			output.responseId ||= typedChunk.id;
+			if (
+				typeof typedChunk.model === "string" &&
+				typedChunk.model.length > 0 &&
+				typedChunk.model !== model.id
+			) {
+				const serverModel = typedChunk.model;
+				// Lemonade may return the full GGUF cache path;
+				// strip `/*/huggingface/hub/` prefix for readability.
+				const match = serverModel.match(HF_HUB_PREFIX_RE);
+				const resolvedModel =
+					match
+						? serverModel.slice((match.index ?? 0) + match[0].length)
+						: serverModel;
+				output.responseModel ||= resolvedModel;
+			}
 			if (typedChunk.usage) {
-				output.usage = parseChunkUsage(typedChunk.usage);
+				output.usage = parseChunkUsage(typedChunk.usage, model);
 			}
 
 			const choice = Array.isArray(typedChunk.choices)
@@ -824,7 +1604,25 @@ export const stream: StreamFunction<
 		try {
 			await retryStreamLoop(executeStream, {
 				maxRetries: options?.maxRetries,
+				maxRetryDelayMs: options?.maxRetryDelayMs,
 				signal: options?.signal,
+				isRetryable: (error) => {
+					// A pre-stream HTTP failure already consumed its full retry budget
+					// inside retryProviderRequest; only status-less errors (SSE-embedded
+					// Lemonade errors, thrown while iterating) reach the stream-layer
+					// backoff. Without this guard a 429 with a Lemonade-shaped body was
+					// retried by BOTH layers — (maxRetries+1)² requests instead of
+					// maxRetries+1, up to ~48 min of backoff at the defaults.
+					if (isProviderHttpError(error) && error.status !== undefined)
+						return false;
+					if (!isRetryableStreamError(error)) return false;
+					if (output.content.length === 0) return true;
+					// Once content reached the consumer, a retry would duplicate it
+					// in the same assistant message (upstream pi only retries before
+					// the stream starts), so surface the error instead.
+					retrySuppressed = true;
+					return false;
+				},
 			});
 		} catch (error) {
 			// Clean up partial content blocks
@@ -845,8 +1643,8 @@ export const stream: StreamFunction<
 					lemonadeError &&
 					typeof lemonadeError === "object" &&
 					"message" in lemonadeError &&
-					// retryStreamLoop already formatted this via formatLemonadeError;
-					// avoid double-formatting its synthetic Error.
+					// the mid-stream SSE branch above may already have formatted
+					// this; avoid double-formatting its synthetic Error.
 					!(
 						error instanceof Error && error.message.startsWith("Lemonade mid-stream")
 					)
@@ -857,6 +1655,12 @@ export const stream: StreamFunction<
 				} else {
 					output.errorMessage =
 						error instanceof Error ? error.message : String(error);
+				}
+				if (
+					retrySuppressed &&
+					!output.errorMessage?.endsWith(RETRY_SUPPRESSED_NOTE)
+				) {
+					output.errorMessage = `${output.errorMessage ?? ""}${RETRY_SUPPRESSED_NOTE}`;
 				}
 			}
 			eventStream.push({
@@ -876,7 +1680,7 @@ export const streamSimple: StreamFunction<
 	SimpleStreamOptions
 > = (
 	model: Model<"openai-completions">,
-	context: Context,
+	context: ProviderContext,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream => {
 	getClientApiKey(
