@@ -39,9 +39,37 @@
  * 4. **Downloaded, cloud recipe** — cloud models, lowest priority, case-insensitive sort.
  *
  * Recipe and label fields from `/v1/models` are not consulted for filtering.
- * Reasoning and vision detection are disabled: Lemonade's chat endpoint uses
- * the model's default behavior, and pi only sends text input
- * (see https://github.com/lemonade-sdk/lemonade/issues/1511).
+ * Vision detection is capability-based: models whose `/api/show` reports the
+ * `vision` capability are registered with `input: ["text", "image"]`, so pi's
+ * image paste/drag reaches them as OpenAI `image_url` content parts (the
+ * llama.cpp backend loads the `mmproj` companion automatically).
+ * Reasoning detection is capability-based with a builtin-models family
+ * fallback:
+ * models reporting the `thinking` capability expose thinking-level control;
+ * when no model in the catalog reports it, the server is assumed to predate
+ * the capability and every model keeps the toggle (per-model `models.json`
+ * overrides win). The catalog also labels only some thinking-capable models
+ * as `reasoning` (mostly the GGUF variants of families whose vLLM variants
+ * are labelled), so an id of a builtin model in a family with a verified
+ * working toggle (`isBuiltinModelsThinkingFamily`, `builtin-models-heuristics.ts`) gets
+ * the selector too — the matching `thinkingFormat` hint is already in
+ * `compat`.
+ *
+ * `compat.thinkingFormat` for builtin-model ids comes from
+ * `builtinModelsCompatHints` (`builtin-models-heuristics.ts`) — id-based heuristics
+ * derived from the fetched builtin-models chat templates: `qwen` for
+ * Qwen3.8 (its template reads `enable_thinking` **and** a strict
+ * `reasoning_effort` enum), `qwen-chat-template` for the
+ * `enable_thinking`-kwarg families
+ * (Qwen3/3.5/3.6, MiniCPM, GLM-4.5/4.7, Nemotron-3, Ornith, DeepSeek-V4, …),
+ * `deepseek` for DeepSeek-R1-Distill, `chat-template` + kwargs for LFM2.5
+ * and Muse-Glimmer (`reasoning_strength`).
+ * `thinkingLevelMap` for those graded-effort models comes from
+ * `builtinModelsThinkingLevelMap` (Qwen3.8: `low`/`medium`/`xhigh`, with
+ * `minimal` and `high` hidden as duplicates; gpt-oss and Muse-Glimmer:
+ * none/minimal/low/medium/high).
+ * The default `openai` format (unchanged) is correct for gpt-oss and inert
+ * for the always-on families. A `models.json` `compat` override always wins.
  *
  * Everything else — context window, output cap, reasoning overrides, compat
  * flags — can be customised per-model via `~/.pi/agent/models.json`
@@ -62,6 +90,7 @@
  */
 
 import { readFile } from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import type {
@@ -92,6 +121,14 @@ import {
 	stream,
 	streamSimple,
 } from "./lemonade-completions.ts";
+import { builtinModelsCompatHints, builtinModelsThinkingLevelMap, isBuiltinModelsThinkingFamily } from "./builtin-models-heuristics.ts";
+import {
+	DEFAULT_BEACON_MS,
+	probeServerStatus,
+	scanLemonadeServers,
+	shouldRunStartupScan,
+	type ScannedServer,
+} from "./server-scan.ts";
 
 // ── defaults ────────────────────────────────────────────────────────────────
 
@@ -106,7 +143,7 @@ const DEFAULT_TIMEOUT_MS = 4000;
  *  `DEFAULT_TIMEOUT_MS`; without an overall deadline a server that accepts
  *  connections but never answers could stall pi startup for
  *  `DEFAULT_TIMEOUT_MS × ceil(modelCount / OLLAMA_CONCURRENCY)` (20 models
- *  ≈ 16 s). Override with `LEMONADE_DISCOVERY_TIMEOUT_MS`. */
+ *  ≈ 16 s). Override with `discoveryTimeoutMs` in pi-provider-lemonade.json. */
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 20000;
 /** Output cap for models whose server does not expose one. */
 const DEFAULT_MAX_OUTPUT_TOKENS = 16384;
@@ -119,25 +156,32 @@ const DEFAULT_CONTEXT_WINDOW = 128000;
  *  CLI's `launch` subcommand uses its own `"lemonade"` placeholder for the
  *  agent environment — the value is meaningless to the server either way.) */
 const PLACEHOLDER_API_KEY = "sk-lemonade-local";
+/** Reachability-probe timeout for the `/login` candidate list and the
+ *  network scan (one `GET /v1/health` per candidate/host). */
+const PROBE_TIMEOUT_MS = 1000;
+/** Option ids for the `/login` select prompt's action entries. */
+const SCAN_OPTION_ID = "__scan-lemonade";
+const CUSTOM_OPTION_ID = "__custom-lemonade-url";
 
-// ── Completions backend switch ─────────────────────────────────────────────────
+// ── Streaming mode switch ────────────────────────────────────────────────────
 //
-// The `x-pi-provider-lemonade` header in the lemonade provider's models.json
-// `headers` selects the streaming backend per request:
+// Which implementation streams the response is selected by `streamingMode`
+// in `pi-provider-lemonade.json` (agent directory — see the extension
+// config file section below):
 //
-//   "openai-completions"   — pi's built-in OpenAI-compatible streaming
-//                            (the host's pi-ai, via the compat alias above)
-//   "lemonade-completions" — this extension's fork (default): Lemonade error
+//   "extension" (default) — this extension's fork: Lemonade error
 //                            reporting and retry tuning
+//   "builtin"             — pi's built-in OpenAI-compatible streaming
+//                            (the host's pi-ai, via the compat alias above)
 //
-// The header is a private extension channel: it rides on the request to the
-// Lemonade server (which ignores it), and both the session-start
-// notice/warning and the per-request dispatch read it.
+// The deprecated `x-pi-provider-lemonade` header in the lemonade provider's
+// models.json `headers` still selects it per request when the file does not
+// set `streamingMode` ("openai-completions" = builtin, anything else =
+// extension). The header is a private extension channel: it rides on the
+// request to the Lemonade server (which ignores it), and both the
+// session-start notice and the per-request dispatch read it.
 export const COMPLETIONS_HEADER = "x-pi-provider-lemonade";
 export type CompletionsMode = "lemonade-completions" | "openai-completions";
-
-/** Newest pi version this extension has been verified against. */
-const NEWEST_TESTED_PI = "0.86";
 
 function completionsHeaderValue(
 	headers?: Record<string, string | null>,
@@ -168,97 +212,25 @@ export function resolveCompletionsMode(headers?: Record<string, string | null>):
 	};
 }
 
-/** Whether `version` is newer than the newest pi this extension was tested on. */
-export function isUntestedPiVersion(version: string | undefined): boolean {
-	if (!version) return false;
-	const match = /^(\d+)\.(\d+)/.exec(version);
-	if (!match) return false;
-	const [testedMajor, testedMinor] = NEWEST_TESTED_PI.split(".").map(Number);
-	const major = Number(match[1]);
-	const minor = Number(match[2]);
-	return major > testedMajor || (major === testedMajor && minor > testedMinor);
-}
-
 /**
- * Startup warnings for the backend switch. The untested-pi warning fires only
- * when the user made no valid explicit choice (header absent or unrecognized)
- * — either recognized value acknowledges the risk.
+ * Startup warning for the deprecated header: an unrecognized value (the
+ * recognized values are the ones the switch understands — the untested-pi
+ * warning was removed, the escape hatch to the built-in backend is
+ * documented in the README instead of announced at startup).
  */
 export function completionsWarnings(
-	piVersion: string | undefined,
 	headerValue: string | undefined,
 ): string[] {
-	const warnings: string[] = [];
-	const recognized =
+	if (
+		headerValue === undefined ||
 		headerValue === "openai-completions" ||
-		headerValue === "lemonade-completions";
-	if (headerValue !== undefined && !recognized) {
-		warnings.push(
-			`Invalid "${COMPLETIONS_HEADER}" value "${headerValue}" (expected "openai-completions" or "lemonade-completions") — using "lemonade-completions".`,
-		);
+		headerValue === "lemonade-completions"
+	) {
+		return [];
 	}
-	if (isUntestedPiVersion(piVersion) && !recognized) {
-		warnings.push(
-			`pi ${piVersion} is newer than the newest version this extension was tested against (${NEWEST_TESTED_PI}). ` +
-				`If streaming misbehaves (e.g. missing system prompt or tools, request errors), add ` +
-				`"${COMPLETIONS_HEADER}": "openai-completions" to the lemonade provider's "headers" in models.json ` +
-				`to use pi's built-in OpenAI-compatible streaming — or set it to "lemonade-completions" ` +
-				`to keep the extension's streaming and silence this warning.`,
-		);
-	}
-	return warnings;
-}
-
-let piVersionOverride: string | null = null;
-let piVersionPromise: Promise<string | undefined> | undefined;
-
-/** Test hook: force the detected pi version (null restores auto-detection). */
-export function setPiVersionForTests(version: string | null): void {
-	piVersionOverride = version;
-	piVersionPromise = undefined;
-}
-
-/**
- * Detect the host pi's version, lazily and defensively:
- *  1. `VERSION` from `@earendil-works/pi-coding-agent` — under pi the bare
- *     specifier is aliased to the host's bundled copy (both install modes),
- *     so this is the host's version, not the extension's devDep;
- *  2. the `package.json` next to the executable (npm / binary install layout).
- * Unknown → `undefined`, which suppresses the untested-pi warning rather
- * than guessing.
- */
-function detectPiVersion(): Promise<string | undefined> {
-	piVersionPromise ??= (async () => {
-		if (piVersionOverride !== null) return piVersionOverride;
-		try {
-			const mod: unknown = await import("@earendil-works/pi-coding-agent");
-			const version = (mod as { VERSION?: unknown }).VERSION;
-			if (typeof version === "string" && /^\d+\.\d+/.test(version)) {
-				return version;
-			}
-		} catch {
-			// Host bundle not resolvable (non-pi environment) — try disk.
-		}
-		try {
-			let dir = path.dirname(process.argv[1] ?? "");
-			for (let i = 0; i < 6 && dir.length > 1; i++) {
-				const pkg = JSON.parse(
-					await readFile(path.join(dir, "package.json"), "utf8"),
-				) as { name?: unknown; version?: unknown };
-				if (
-					pkg.name === "@earendil-works/pi-coding-agent" &&
-					typeof pkg.version === "string"
-				) {
-					return pkg.version;
-				}
-				dir = path.dirname(dir);
-			}
-		} catch {
-			// No readable package.json — version unknown.
-		}
-		return undefined;
-	})();
-	return piVersionPromise;
+	return [
+		`Invalid "${COMPLETIONS_HEADER}" value "${headerValue}" (expected "openai-completions" or "lemonade-completions") — using "lemonade-completions".`,
+	];
 }
 
 /** Read the switch from the provider's composed auth (models.json headers). */
@@ -275,6 +247,145 @@ async function readCompletionsHeader(
 		return completionsHeaderValue(result?.auth?.headers);
 	} catch {
 		return undefined;
+	}
+}
+
+// ── Extension config file ───────────────────────────────────────────────────
+//
+// `pi-provider-lemonade.json` in the agent directory (`PI_CODING_AGENT_DIR`,
+// or `~/.pi/agent` by default — the same directory as `auth.json` and
+// `models.json`) holds the extension's configuration:
+//
+//   {
+//     "discoveryTimeoutMs": 20000,        // overall discovery budget (ms)
+//     "streamingMode": "builtin"          // "extension" | "builtin"
+//   }
+//
+// Both keys are optional; a missing file means all defaults. The file takes
+// precedence over the deprecated sources: the `LEMONADE_DISCOVERY_TIMEOUT_MS`
+// env var and the models.json `x-pi-provider-lemonade` header. It is read
+// once per extension load (a /reload re-runs the factory and re-reads it);
+// a malformed file never breaks startup — it warns once and falls back.
+
+export const EXTENSION_CONFIG_FILE = "pi-provider-lemonade.json";
+
+/** Parsed and validated pi-provider-lemonade.json content. */
+export interface ExtensionFileConfig {
+	/** Overall discovery budget in ms (replaces LEMONADE_DISCOVERY_TIMEOUT_MS). */
+	discoveryTimeoutMs?: number;
+	/**
+	 * Streaming implementation (replaces the x-pi-provider-lemonade header):
+	 * "lemonade-completions" for "extension", "openai-completions" for
+	 * "builtin".
+	 */
+	streamingMode?: CompletionsMode;
+	/**
+	 * Run the background startup scan. Unset → the platform default
+	 * (on on Linux, off on macOS/Windows — their firewalls prompt about
+	 * the beacon listener's inbound UDP); true forces it on, false off.
+	 * The on-demand /login scan is never affected.
+	 */
+	startupScan?: boolean;
+	/** Problems found while parsing the file (unknown keys, bad values). */
+	warnings: string[];
+}
+
+/** The agent directory: `PI_CODING_AGENT_DIR` (`~/` expanded) or `~/.pi/agent`. */
+function agentDir(env: Record<string, string | undefined>): string {
+	const raw = (env.PI_CODING_AGENT_DIR ?? "").trim();
+	if (!raw) return path.join(os.homedir(), ".pi", "agent");
+	return raw.startsWith("~/") ? path.join(os.homedir(), raw.slice(2)) : raw;
+}
+
+/**
+ * Parse and validate the extension config file content. Throws on malformed
+ * JSON or a non-object top level; per-key problems are collected in
+ * `warnings` (the offending key is ignored, the rest of the file applies).
+ */
+export function parseExtensionConfig(raw: string): ExtensionFileConfig {
+	const data: unknown = JSON.parse(raw);
+	if (typeof data !== "object" || data === null || Array.isArray(data)) {
+		throw new Error("the top-level JSON value must be an object");
+	}
+	const obj = data as Record<string, unknown>;
+	const warnings: string[] = [];
+	for (const key of Object.keys(obj)) {
+		if (
+			key !== "discoveryTimeoutMs" &&
+			key !== "streamingMode" &&
+			key !== "startupScan"
+		) {
+			warnings.push(
+				`ignoring unknown key "${key}" in ${EXTENSION_CONFIG_FILE} (known keys: discoveryTimeoutMs, streamingMode, startupScan)`,
+			);
+		}
+	}
+	const config: ExtensionFileConfig = { warnings };
+	if (obj.discoveryTimeoutMs !== undefined) {
+		// Same strictness as the env var: a positive integer (a JSON number,
+		// not a digit string).
+		if (
+			typeof obj.discoveryTimeoutMs === "number" &&
+			Number.isInteger(obj.discoveryTimeoutMs) &&
+			obj.discoveryTimeoutMs > 0
+		) {
+			config.discoveryTimeoutMs = obj.discoveryTimeoutMs;
+		} else {
+			warnings.push(
+				`ignoring the invalid "discoveryTimeoutMs" (${JSON.stringify(obj.discoveryTimeoutMs)}) in ${EXTENSION_CONFIG_FILE}, using ${DEFAULT_DISCOVERY_TIMEOUT_MS}`,
+			);
+		}
+	}
+	if (obj.streamingMode !== undefined) {
+		if (obj.streamingMode === "extension" || obj.streamingMode === "builtin") {
+			config.streamingMode =
+				obj.streamingMode === "builtin"
+					? "openai-completions"
+					: "lemonade-completions";
+		} else {
+			warnings.push(
+				`ignoring the invalid "streamingMode" (${JSON.stringify(obj.streamingMode)}) in ${EXTENSION_CONFIG_FILE} (expected "extension" or "builtin"), using "extension"`,
+			);
+		}
+	}
+	if (obj.startupScan !== undefined) {
+		if (typeof obj.startupScan === "boolean") {
+			config.startupScan = obj.startupScan;
+		} else {
+			warnings.push(
+				`ignoring the invalid "startupScan" (${JSON.stringify(obj.startupScan)}) in ${EXTENSION_CONFIG_FILE} (expected true or false), using the platform default`,
+			);
+		}
+	}
+	return config;
+}
+
+/**
+ * Read the extension config file from the agent directory. Never throws: a
+ * missing file yields an empty config; a malformed file yields warnings and
+ * an empty config, so a typo in the file can never block pi startup.
+ */
+export async function readExtensionConfig(
+	// The `?? {}` makes the default honest on non-Node hosts (where
+	// `process` is absent) — see `readConfig`.
+	env: Record<string, string | undefined> = (
+		(globalThis as { process?: NodeJS.Process }).process?.env ?? {}
+	) as Record<string, string | undefined>,
+): Promise<ExtensionFileConfig> {
+	const dir = agentDir(env);
+	try {
+		const raw = await readFile(path.join(dir, EXTENSION_CONFIG_FILE), "utf8");
+		return parseExtensionConfig(raw);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return { warnings: [] };
+		}
+		const message = error instanceof Error ? error.message : String(error);
+		return {
+			warnings: [
+				`could not read ${EXTENSION_CONFIG_FILE} in ${dir} (${message}) — using defaults`,
+			],
+		};
 	}
 }
 
@@ -462,7 +573,8 @@ export function bracketHostIfIpv6(host: string): string {
 	return host;
 }
 
-/** Read configuration from the environment. Called on every extension load (and /reload). */
+/** Read configuration from the environment (and the extension config file).
+ *  Called on every extension load (and /reload). */
 export function readConfig(
 	// The `?? {}` makes the default honest on non-Node hosts (where
 	// `process` is absent): `readConfig()` with no env then sees an empty
@@ -471,6 +583,9 @@ export function readConfig(
 	_env: Record<string, string | undefined> = (
 		(globalThis as { process?: NodeJS.Process }).process?.env ?? {}
 	) as Record<string, string | undefined>,
+	// The parsed pi-provider-lemonade.json (see readExtensionConfig). Its
+	// values take precedence over the deprecated env sources.
+	_file: ExtensionFileConfig = { warnings: [] },
 ): LemonadeConfig {
 	// LEMONADE_HOST is parsed exactly like the Lemonade SDK CLI does
 	// (src/cpp/cli/main.cpp → lemon::utils::parse_target_url): it may be a
@@ -481,13 +596,17 @@ export function readConfig(
 	// (CLI11 would reject it outright).
 	const host = (_env.LEMONADE_HOST ?? "").trim() || DEFAULT_HOST;
 	const portEnv = _env.LEMONADE_PORT;
-	const explicitPort = portEnv !== undefined && portEnv !== "";
 	// Same strictness as `parseTargetUrl`'s port validation (SDK
 	// `std::from_chars` parity): trimmed, base-10 digits only, 1..65535.
 	// An out-of-range value (`99999`) or a non-decimal one (`0x10`) must not
 	// reach the base URL — it would only surface later as a confusing
 	// connection error instead of a named correction.
 	const envPortRaw = (portEnv ?? "").trim();
+	// Explicitness is judged on the *trimmed* value: a whitespace-only
+	// `LEMONADE_PORT` counts as unset (matching the API-key handling in
+	// `cleanEnvKey`) rather than "explicit but invalid" — so it neither
+	// warns nor suppresses the scheme-default port override.
+	const explicitPort = envPortRaw !== "";
 	const envPort = /^\d+$/.test(envPortRaw) ? Number(envPortRaw) : NaN;
 	const hasValidPortEnv =
 		Number.isInteger(envPort) && envPort >= 1 && envPort <= 65535;
@@ -512,36 +631,67 @@ export function readConfig(
 		);
 		port = initialPort;
 	}
+	// Overall discovery budget: pi-provider-lemonade.json wins over the
+	// deprecated LEMONADE_DISCOVERY_TIMEOUT_MS — a set env var is reported
+	// either way, so the startup notice can point at the file.
+	const envTimeoutSet =
+		_env.LEMONADE_DISCOVERY_TIMEOUT_MS !== undefined &&
+		_env.LEMONADE_DISCOVERY_TIMEOUT_MS.trim() !== "";
+	let discoveryTimeoutMs: number;
+	if (_file.discoveryTimeoutMs !== undefined) {
+		discoveryTimeoutMs = _file.discoveryTimeoutMs;
+		if (envTimeoutSet) {
+			warnings.push(
+				`LEMONADE_DISCOVERY_TIMEOUT_MS is deprecated and ignored — "discoveryTimeoutMs" in ${EXTENSION_CONFIG_FILE} takes precedence`,
+			);
+		}
+	} else {
+		discoveryTimeoutMs = readDiscoveryTimeoutMs(_env, warnings);
+		if (envTimeoutSet) {
+			warnings.push(
+				`LEMONADE_DISCOVERY_TIMEOUT_MS is deprecated — set "discoveryTimeoutMs" in ${EXTENSION_CONFIG_FILE} instead`,
+			);
+		}
+	}
 	return {
 		baseUrl: buildBaseUrl(parsed.host, port, parsed.isSsl),
-		// Key resolution matches the Lemonade CLI: a non-empty
-		// LEMONADE_ADMIN_API_KEY overrides LEMONADE_API_KEY (src/cpp/cli/
-		// main.cpp). Lemonade ignores the key unless LEMONADE_API_KEY is set
-		// server-side, but pi requires a non-empty one to consider the
-		// provider authenticated.
+		// Key resolution matches the Lemonade CLI: a non-empty (after
+		// trimming) LEMONADE_ADMIN_API_KEY overrides LEMONADE_API_KEY
+		// (src/cpp/cli/main.cpp). Lemonade ignores the key unless
+		// LEMONADE_API_KEY is set server-side, but pi requires a non-empty
+		// one to consider the provider authenticated. Whitespace is trimmed
+		// — a padded key would not match the server's stored value, and a
+		// whitespace-only value is treated as unset.
 		apiKey:
-			_env.LEMONADE_ADMIN_API_KEY ||
-			_env.LEMONADE_API_KEY ||
+			cleanEnvKey(_env.LEMONADE_ADMIN_API_KEY) ||
+			cleanEnvKey(_env.LEMONADE_API_KEY) ||
 			PLACEHOLDER_API_KEY,
 		provider: DEFAULT_PROVIDER,
 		timeoutMs: DEFAULT_TIMEOUT_MS,
-		discoveryTimeoutMs: readDiscoveryTimeoutMs(_env, warnings),
+		discoveryTimeoutMs,
 		maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
 		contextWindow: DEFAULT_CONTEXT_WINDOW,
 		warnings,
 	};
 }
 
-/** Overall discovery budget: `LEMONADE_DISCOVERY_TIMEOUT_MS` when it is a
- *  positive integer, otherwise `DEFAULT_DISCOVERY_TIMEOUT_MS`. A malformed
- *  override is reported by pushing onto the caller's `warnings` array, so the
- *  startup notice can name the value that was ignored. */
+/** Overall discovery budget from the deprecated `LEMONADE_DISCOVERY_TIMEOUT_MS`
+ *  env var: the value when it is a positive integer, otherwise
+ *  `DEFAULT_DISCOVERY_TIMEOUT_MS`. A malformed override is reported by
+ *  pushing onto the caller's `warnings` array, so the startup notice can
+ *  name the value that was ignored. (The primary source is
+ *  `discoveryTimeoutMs` in pi-provider-lemonade.json — see `readConfig`.) */
 function readDiscoveryTimeoutMs(
 	env: Record<string, string | undefined>,
 	warnings: string[],
 ): number {
 	const raw = env.LEMONADE_DISCOVERY_TIMEOUT_MS;
-	const ms = Number(raw);
+	// Same strictness as `parseTargetUrl`'s port validation: trimmed,
+	// base-10 digits only. `Number()` alone would accept `0x10` (→ a 16 ms
+	// budget) and `1e3` (→ 1000 ms) — the bug class the `LEMONADE_PORT`
+	// hardening removed.
+	const trimmed = (raw ?? "").trim();
+	const ms = /^\d+$/.test(trimmed) ? Number(trimmed) : NaN;
 	if (Number.isInteger(ms) && ms > 0) return ms;
 	if (raw !== undefined && raw !== "") {
 		warnings.push(
@@ -560,9 +710,34 @@ export function buildBaseUrl(host: string, port: number, isSsl = false): string 
 	return `${isSsl ? "https" : "http"}://${bracketHostIfIpv6(host)}:${port}`;
 }
 
-/** `http://host:port` → `host:port`, for the provider's display name. */
-function displayHost(baseUrl: string): string {
-	return baseUrl.replace(/^https?:\/\//, "").replace(/:\d+$/, "");
+/**
+ * Normalize the server URL entered at `/login lemonade`.
+ *
+ * Unlike `parseTargetUrl` (which strips path/query/fragment for `LEMONADE_HOST`
+ * SDK parity), a credential URL may carry a reverse-proxy **path prefix** —
+ * that is one of the reasons it exists — and the path must survive. The result
+ * is the *server base*: the extension appends `/v1` itself (discovery paths
+ * and the `auth.baseUrl` returned by `resolve()`).
+ *
+ * Accepted: a full `http://`/`https://` URL, or a schemeless `host[:port]`
+ * (treated as `http://`, matching how `LEMONADE_HOST` treats a bare host).
+ * Trailing slashes and a trailing `/v1` (users pasting the full API URL) are
+ * removed; query and fragment are dropped.
+ *
+ * @throws when the value is empty or does not parse as an http(s) URL.
+ */
+export function normalizeLemonadeServerUrl(value: string): string {
+	const raw = value.trim();
+	if (!raw) throw new Error("Lemonade server URL is empty");
+	const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
+	const url = new URL(withScheme);
+	if (url.protocol !== "http:" && url.protocol !== "https:") {
+		throw new Error(`Lemonade server URL must use http or https: ${raw}`);
+	}
+	url.hash = "";
+	url.search = "";
+	url.pathname = url.pathname.replace(/\/+$/u, "").replace(/\/v1$/u, "") || "/";
+	return url.toString().replace(/\/$/u, "");
 }
 
 // ── model filtering & mapping ────────────────────────────────────────────────
@@ -604,16 +779,39 @@ export function isChatCompletionLLM(m: LemonadeModel): boolean {
 /**
  * Map one `/v1/models` entry to a pi `Model<"openai-completions">`.
  *
- * - `reasoning` is `true` — Lemonade supports per-request thinking
- *   configuration, so pi's thinking-level control is exposed and the selected
- *   level goes on the wire (default `openai` format → `reasoning_effort`).
- *   Models that cannot act on thinking parameters opt out per-model with
- *   `reasoning: false` in `models.json`.
- * - `input` is always `["text"]` — pi only sends text, even to vision-capable
- *   models, because Lemonade's OpenAI-compatible endpoint handles image input
- *   differently from pi's `input` field semantics.
- * - `thinkingLevelMap` is `undefined` — all standard effort levels are
- *   exposed; restrict or remap them per-model in `models.json` if needed.
+ * - `reasoning` is derived from the `thinking` capability (Ollama-compatible
+ *   `/api/show`, label-derived server-side from the model's `reasoning`
+ *   metadata): models reporting it get thinking-level control exposed (the
+ *   selected level goes on the wire, default `openai` format →
+ *   `reasoning_effort`); models that do not get `reasoning: false` (no
+ *   thinking parameters are sent, the TUI selector is hidden). When no model
+ *   in the whole catalog reports `thinking`, the server is assumed to
+ *   predate the capability and the legacy `true` default is kept (a silent
+ *   server must not strip the toggle from every model). Per-model overrides
+ *   in `models.json` always win.
+ * - `input` is `["text", "image"]` when the model reports the `vision`
+ *   capability (Ollama-compatible `/api/show`, label-derived from GGUF
+ *   metadata) and `["text"]` otherwise — pi's image paste/drag then reaches
+ *   the model as OpenAI `image_url` content parts, which Lemonade forwards
+ *   to the backend (the llama.cpp backend loads the `mmproj` companion
+ *   automatically). Vision models without an `mmproj` file fail on image
+ *   input (lemonade-sdk/lemonade#955); image tokens consume the text
+ *   context window. Override per-model in `models.json` if needed.
+ * - `thinkingLevelMap` is `{ off, medium }` only by default (matching the
+ *   built-in llama.cpp provider — local templates understand at most a
+ *   boolean or a few levels). `off: "none"` deliberately deviates from the
+ *   built-in provider's `off: "off"`: the `openai` format sends the map value
+ *   as `reasoning_effort`, and llama.cpp accepts none/minimal/low/medium/high
+ *   (`none` is the hard disable; `off` is not a valid value). Builtin-model
+ *   ids whose templates accept a graded effort (Qwen3.8, gpt-oss,
+ *   Muse-Glimmer) get a wider per-model map from
+ *   `builtinModelsThinkingLevelMap` instead. Builtin-model ids additionally
+ *   get `compat.thinkingFormat` (and, for LFM2.5/Muse-Glimmer,
+ *   `compat.chatTemplateKwargs`) from `builtinModelsCompatHints` in
+ *   `builtin-models-heuristics.ts` — id heuristics derived from the fetched
+ *   builtin-models chat templates (Lemonade does not expose the template;
+ *   lemonade-sdk/lemonade#3644). Restrict or remap per-model in
+ *   `models.json` if needed.
  * - `cost` is derived from `/v1/models` `cost_input_per_million` /
  *   `cost_output_per_million` when present and positive; falls back to
  *   zero when the server does not report per-token pricing.
@@ -634,6 +832,7 @@ export function isChatCompletionLLM(m: LemonadeModel): boolean {
 export function toModel(
 	m: LemonadeModel,
 	config: LemonadeConfig = readConfig({}),
+	opts?: { assumeThinking?: boolean },
 ): Model<"openai-completions"> {
 	const cw = m.contextLength ?? m.max_context_window;
 	// Treat a missing or non-positive value as absent: a value of
@@ -651,14 +850,69 @@ export function toModel(
 			? m.cost_output_per_million
 			: 0;
 
+	// Reasoning detection: the `thinking` capability is the per-model
+	// signal. The catalog-level `assumeThinking` (set by `discoverModels`
+	// when no model in the whole catalog reports `thinking` — the server
+	// is assumed to predate the capability) keeps the legacy `true`
+	// default on every model; a server that never emits the capability
+	// must not strip the thinking toggle from every model. Models without
+	// capability data (the `discovery-failed` placeholder) also keep the
+	// legacy default.
+	//
+	// Builtin-models family fallback: the catalog labels only some
+	// thinking-capable models as `reasoning` (mostly the GGUF variants of
+	// families whose vLLM variants are labelled), so an id of a builtin
+	// model in a family with a verified working toggle
+	// (`isBuiltinModelsThinkingFamily`, see builtin-models-heuristics.ts) also gets the
+	// selector — the matching `thinkingFormat` hint is already in `compat`
+	// below. A `models.json`
+	// `reasoning` override always wins.
+	const reasoning =
+		opts?.assumeThinking === true
+			? true
+			: (m.capabilities?.includes("thinking") ?? true) ||
+				isBuiltinModelsThinkingFamily(m.id);
+
+	// Builtin-models compat hints (id heuristics from the fetched
+	// builtin-models chat templates — see builtin-models-heuristics.ts). `models.json` compat
+	// overrides applied later by pi always win.
+	const hints = builtinModelsCompatHints(m.id);
+
 	return {
 		id: m.id,
 		name: sanitizeModelId(m.id),
 		api: "openai-completions",
 		provider: config.provider,
 		baseUrl: config.baseUrl + "/v1",
-		reasoning: true, // thinking levels are exposed; the TUI level goes on the wire
-		input: ["text"] as ("text" | "image")[], // pi only sends text input
+		reasoning,
+		...(reasoning && {
+			// Default: only off and medium are exposed — the built-in
+			// llama.cpp provider restricts its thinking models the same way
+			// (local templates understand at most a boolean or a few levels).
+			// `off: "none"` deliberately deviates from the built-in
+			// provider's `off: "off"`: the `openai` format sends the map
+			// value on the wire as `reasoning_effort`, and llama.cpp
+			// accepts none/minimal/low/medium/high — `none` is the hard
+			// disable, `off` is not a valid value. The `qwen-chat-template`
+			// format never reads the map (it sends the `enable_thinking`
+			// boolean), so the value is inert there.
+			//
+			// Builtin models whose templates accept a graded effort
+			// (Qwen3.8, gpt-oss, Muse-Glimmer) get a wider per-model map
+			// from `builtinModelsThinkingLevelMap` instead.
+			thinkingLevelMap:
+				builtinModelsThinkingLevelMap(m.id) ?? {
+					off: "none",
+					minimal: null,
+					low: null,
+					medium: "medium",
+					high: null,
+					xhigh: null,
+				},
+		}),
+		input: m.capabilities?.includes("vision")
+			? ["text", "image"]
+			: ["text"],
 		cost: { input: costInput, output: costOutput, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: ctx,
 		maxTokens: Math.max(1, Math.min(config.maxOutputTokens, ctx)),
@@ -669,6 +923,12 @@ export function toModel(
 			// true (the default `openai` thinking format needs it to send
 			// `reasoning_effort`).
 			maxTokensField: "max_tokens",
+			...(hints?.thinkingFormat !== undefined && {
+				thinkingFormat: hints.thinkingFormat,
+			}),
+			...(hints?.chatTemplateKwargs !== undefined && {
+				chatTemplateKwargs: hints.chatTemplateKwargs,
+			}),
 		},
 	};
 }
@@ -1013,10 +1273,21 @@ export async function discoverModels(
 		const res = await fetchUrl("/v1/models");
 		if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
 
-		const payload = (await res.json()) as { data?: LemonadeModel[] };
-		entries = (payload?.data ?? []).filter(
+		const payload = (await res.json()) as { data?: unknown };
+		// A 200 whose body is not a models payload (a proxy error page, a
+		// misrouted response) is a failure, not "no downloaded models" —
+		// treating it as empty would tell the user to download a model from a
+		// server that is not answering with a model list at all.
+		if (!Array.isArray(payload?.data)) {
+			throw new Error("/v1/models response is malformed (data is not an array)");
+		}
+		entries = payload.data.filter(
 			(m): m is LemonadeModel =>
-				typeof m?.id === "string" && m.id.length > 0 && m.downloaded === true, // only locally-present models
+				m !== null &&
+				typeof m === "object" &&
+				typeof (m as LemonadeModel).id === "string" &&
+				(m as LemonadeModel).id.length > 0 &&
+				(m as LemonadeModel).downloaded === true, // only locally-present models
 		);
 		// The server answered successfully — an empty catalog is the honest state,
 		// not a transport failure. Reporting it as one would make `refreshModels`
@@ -1072,7 +1343,12 @@ export async function discoverModels(
 		deadline.dispose();
 	}
 
-	const models = entries.map((m) => toModel(m, config));
+	// A server that reports the `thinking` capability for no model in the
+	// catalog is assumed to predate it (the capability is label-derived
+	// server-side; older builds never emit it) — keep the legacy `true`
+	// default rather than stripping the thinking toggle from every model.
+	const assumeThinking = !entries.some((m) => m.capabilities?.includes("thinking"));
+	const models = entries.map((m) => toModel(m, config, { assumeThinking }));
 	return { models };
 }
 
@@ -1088,7 +1364,72 @@ export async function discoverModels(
  * 3. `LEMONADE_API_KEY` from the injected `AuthContext.env` (read in `resolve`)
  * 4. `process.env` (same admin-over-api precedence; non-Node host fallback)
  * 5. Placeholder (ignored by the server when no auth is configured)
+ *
+ * Env-var-derived values are trimmed — a padded key would not match the
+ * server's stored value, and a whitespace-only value is treated as unset.
+ * The stored `credential.key` is used verbatim.
  */
+
+/** Trim an env-var-derived API key; whitespace-only values count as unset. */
+function cleanEnvKey(value?: string): string | undefined {
+	const trimmed = value?.trim();
+	return trimmed ? trimmed : undefined;
+}
+
+/**
+ * The server URL stored by a previous `/login lemonade` (auth.json on disk).
+ *
+ * `login()` does not receive the current credential (only `check`/`resolve`
+ * do), so the saved candidate is read from pi's credential store: `auth.json`
+ * in the agent directory (`PI_CODING_AGENT_DIR`, or `~/.pi/agent` by
+ * default). Only the URL is read — never the key. A missing or malformed
+ * file, or a stored value that no longer parses, yields `undefined` rather
+ * than breaking the login.
+ */
+async function readSavedServerUrl(provider: string): Promise<string | undefined> {
+	try {
+		const procEnv = (
+			(globalThis as { process?: NodeJS.Process }).process?.env as Record<
+				string,
+				string | undefined
+			>
+		) ?? {};
+		const dir = agentDir(procEnv);
+		const file = JSON.parse(
+			await readFile(path.join(dir, "auth.json"), "utf8"),
+		) as Record<string, { env?: Record<string, unknown> } | undefined>;
+		const value = file[provider]?.env?.LEMONADE_BASE_URL;
+		if (typeof value !== "string" || !value.trim()) return undefined;
+		return normalizeLemonadeServerUrl(value);
+	} catch {
+		return undefined;
+	}
+}
+
+/** One entry of the `/login` server list. */
+interface LoginCandidate {
+	/** Normalized server base URL (also the select option id). */
+	url: string;
+	/** Where the candidate came from (shown in the label). */
+	source: string;
+}
+
+/** The server base URL stored in the `/login lemonade` credential (if any).
+ *  A stored value that no longer parses (written by another version, or
+ *  hand-edited) falls back to the env-derived configuration instead of
+ *  breaking auth. */
+function credentialBaseUrl(
+	credential?: { env?: Record<string, string> },
+): string | undefined {
+	const value = credential?.env?.LEMONADE_BASE_URL;
+	if (typeof value !== "string" || !value.trim()) return undefined;
+	try {
+		return normalizeLemonadeServerUrl(value);
+	} catch {
+		return undefined;
+	}
+}
+
 function resolveApiKey(
 	credential?: { key?: string },
 	apiKeyEnv?: string,
@@ -1100,14 +1441,16 @@ function resolveApiKey(
 	if (credential?.key) {
 		return { apiKey: credential.key, source: "stored API key" };
 	}
-	if (adminApiKeyEnv) {
+	const adminKey = cleanEnvKey(adminApiKeyEnv);
+	if (adminKey) {
 		return {
-			apiKey: adminApiKeyEnv,
+			apiKey: adminKey,
 			source: "LEMONADE_ADMIN_API_KEY environment variable",
 		};
 	}
-	if (apiKeyEnv) {
-		return { apiKey: apiKeyEnv, source: "LEMONADE_API_KEY environment variable" };
+	const apiKey = cleanEnvKey(apiKeyEnv);
+	if (apiKey) {
+		return { apiKey, source: "LEMONADE_API_KEY environment variable" };
 	}
 	return {
 		apiKey: PLACEHOLDER_API_KEY,
@@ -1119,15 +1462,47 @@ function resolveApiKey(
 
 // pi-lens-ignore: high-complexity
 export default async function (pi: ExtensionAPI) {
-	const config = readConfig();
+	const fileConfig = await readExtensionConfig();
+	const config = readConfig(undefined, fileConfig);
+
+	// The file's streamingMode, when set, fixes the backend for every
+	// request — the per-request models.json header dispatch is skipped
+	// (the session_start handler below notices when the two disagree).
+	const fileStreamingMode = fileConfig.streamingMode;
+
+	// Background network scan (UDP beacon + localhost/gateway probe) feeding
+	// the /login candidate list. Fire-and-forget: it never blocks startup,
+	// never reports, and a failed scan just means an empty list. The result
+	// is kept in this closure for the life of the extension load (a /reload
+	// re-runs the factory and re-scans — acceptable, like the other
+	// once-per-load state here).
+	//
+	// Platform-gated: on macOS/Windows the beacon listener's inbound UDP
+	// makes the OS firewall prompt about the node process — a bad surprise
+	// at startup. The file's "startupScan" overrides the platform default
+	// (true forces it on, false off); the on-demand /login scan still runs
+	// on every platform.
+	let scanState: { servers: ScannedServer[]; at: number } | undefined;
+	if (fileConfig.startupScan ?? shouldRunStartupScan()) {
+		void scanLemonadeServers({
+			probeHosts: [new URL(config.baseUrl).hostname],
+		}).then((result) => {
+			scanState = { servers: result.servers, at: Date.now() };
+		}).catch(() => {
+			// a scan must never surface an error
+		});
+	}
+
 	const initial = await discoverModels(config, fetch);
 
 	// Current discovered catalog. `refreshModels` retains the last-known-good
 	// list on failure and persists successful fetches through the provider store.
 	let currentModels = initial.models;
 
-	// A malformed persisted catalog entry is reported once per process (the
-	// refresh runs on every /reload, so it must not be re-announced each time).
+	// A malformed persisted catalog entry is reported once per extension load:
+	// the flag lives in this factory's closure, so it dedupes the repeated
+	// refreshes within one load. A /reload re-runs the factory and re-announces
+	// — acceptable, since /reload is an explicit user action.
 	let storeCorruptionWarned = false;
 	const warnStoreCorruption = (): void => {
 		if (storeCorruptionWarned) return;
@@ -1135,29 +1510,214 @@ export default async function (pi: ExtensionAPI) {
 		// pi-lens-ignore: no-console-except-error,console-statement
 		console.warn(
 			`[pi-provider-lemonade] the persisted model store entry for provider ` +
-				`"${config.provider}" is malformed (models is not an array) — keeping the ` +
-				`last-known-good catalog; fix or delete the entry in ` +
+				`"${config.provider}" is malformed (unreadable, or models is not an array) — ` +
+				`keeping the last-known-good catalog; fix or delete the entry in ` +
 				`~/.pi/agent/models-store.json`,
 		);
 	};
 
 	pi.registerProvider({
 		id: config.provider,
-		name: `Lemonade (${displayHost(config.baseUrl)})`,
+		// Plain name, no host: the name is static (set at registration), but
+		// the server is chosen at /login (the credential URL overrides the
+		// env base) — a host in the name goes stale the moment a different
+		// server is picked, and pi uses it for the login dialog title.
+		name: "Lemonade",
 		baseUrl: config.baseUrl + "/v1",
 		auth: {
 			apiKey: {
 				name: "Lemonade Server API key",
 				async login(interaction): Promise<ApiKeyCredential> {
-					const key = await interaction.prompt({
-						type: "secret",
-						message: "Lemonade API key (leave empty if server doesn't require auth)",
-					});
-					return {
-						type: "api_key",
-						key: key || PLACEHOLDER_API_KEY,
+				// Candidate list: the saved credential's server (auth.json), the
+				// env-derived base, and the servers found by the background scan
+				// (at pi startup, or by a previous on-demand scan). The select
+				// also offers an on-demand re-scan and plain URL entry. pi's
+				// login select renders labels only (descriptions are dropped),
+				// so the source and the reachability status are folded into
+				// each label.
+				const savedUrl = await readSavedServerUrl(config.provider);
+				const buildCandidates = (): LoginCandidate[] => {
+					const seen = new Set<string>();
+					const out: LoginCandidate[] = [];
+					const add = (url: string, source: string): void => {
+						if (seen.has(url)) return;
+						seen.add(url);
+						out.push({ url, source });
 					};
-				},
+					if (savedUrl) add(savedUrl, "saved");
+					const procEnv = (
+						(globalThis as { process?: NodeJS.Process }).process?.env as
+							| Record<string, string | undefined>
+						| undefined
+					) ?? {};
+					const envSet = Boolean(
+						(procEnv.LEMONADE_HOST ?? "").trim() ||
+							(procEnv.LEMONADE_PORT ?? "").trim(),
+					);
+					add(config.baseUrl, envSet ? "LEMONADE_HOST" : "default");
+					for (const s of scanState?.servers ?? [])
+						add(s.origin, s.hostname ?? "scanned");
+					return out;
+				};
+				let baseUrl: string;
+				for (;;) {
+					const list = buildCandidates();
+					// One 1 s parallel reachability pass so the user can pick a
+					// live server; the keyed probe below remains the real check.
+					const statuses = await Promise.all(
+						list.map((c) =>
+							probeServerStatus(
+								c.url,
+								PROBE_TIMEOUT_MS,
+								interaction.signal,
+							),
+						),
+					);
+					const choice = await interaction.prompt({
+						type: "select",
+						message: "Lemonade server",
+						options: [
+							...list.map((c, i) => ({
+								id: c.url,
+								label: `${c.url} (${c.source}, ${statuses[i]})`,
+							})),
+							{ id: SCAN_OPTION_ID, label: "Scan local network…" },
+							{ id: CUSTOM_OPTION_ID, label: "Enter custom URL…" },
+						],
+					});
+					if (choice === SCAN_OPTION_ID) {
+						interaction.notify({
+							// info (not progress): the login dialog renders progress
+							// events as a DIM line, which is easy to miss for a 5 s
+							// wait — info renders in the normal text color. No
+							// duration: the beacon phase takes up to 5 s, but the
+							// scan finishes as soon as the probes/sweep do when the
+							// beacon cannot bind (a local Lemonade app holds the
+							// port).
+							type: "info",
+							message: `Scanning for Lemonade servers (UDP beacon + subnet sweep)…`,
+						});
+							// Stacked countdown: the login dialog can only APPEND
+							// lines (no update/replace API, no spinner), so tick
+							// one dim progress line per second while the scan runs
+							// — at most 5 lines, cleared as soon as the scan
+							// settles (it usually does well before the beacon
+							// window ends). progress (not info): the lines are a
+							// heartbeat, not content — the appearing-line effect
+							// already signals activity, and dim keeps them out of
+							// the way of the info notices.
+							const scanStartedAt = Date.now();
+							const countdown = setInterval(() => {
+								const remaining = Math.ceil(
+									(DEFAULT_BEACON_MS - (Date.now() - scanStartedAt)) / 1000,
+								);
+								if (remaining > 0) {
+									interaction.notify({
+										type: "progress",
+										message: `Scanning… ${remaining} s remaining`,
+									});
+								}
+							}, 1000);
+							let result;
+							try {
+								result = await scanLemonadeServers({
+									probeHosts: [
+										...(savedUrl ? [new URL(savedUrl).hostname] : []),
+										new URL(config.baseUrl).hostname,
+									],
+									signal: interaction.signal,
+								});
+							} finally {
+								clearInterval(countdown);
+							}
+						// Preserve the result: the re-shown list below (and any
+						// later login this session) include the new servers.
+						scanState = { servers: result.servers, at: Date.now() };
+						if (result.beaconError) {
+							interaction.notify({
+								type: "info",
+								message:
+									`Beacon listening is unavailable (${result.beaconError}) — ` +
+									`a local Lemonade app holds the port; the subnet sweep ` +
+									`covers it.`,
+							});
+						}
+						if (result.servers.length === 0) {
+							interaction.notify({
+								type: "info",
+								message:
+									`No Lemonade servers found — probed ` +
+									`${result.probed.join(", ")}` +
+									(result.swept.length
+									? ` and swept ${result.swept.join(", ")}`
+									: "") +
+									` without response; enter a URL manually.`,
+							});
+						}
+						continue; // re-show the refreshed list
+					}
+					let entered: string;
+					if (choice === CUSTOM_OPTION_ID) {
+						entered = await interaction.prompt({
+							type: "text",
+							message: "Lemonade server URL",
+							placeholder: config.baseUrl,
+						});
+					} else if (list.some((c) => c.url === choice)) {
+						entered = choice;
+					} else {
+						// Unknown option id (should not happen in the TUI) —
+						// abort the login rather than storing a garbage URL.
+						throw new Error("Login cancelled");
+					}
+					try {
+						baseUrl = normalizeLemonadeServerUrl(
+							entered.trim() ? entered : config.baseUrl,
+						);
+					} catch (err) {
+						throw new Error(
+							`Invalid Lemonade server URL: ${err instanceof Error ? err.message : String(err)}`,
+						);
+					}
+					break;
+				}
+				const key = await interaction.prompt({
+					type: "secret",
+					// The message names the selected server: the dialog still
+					// shows the earlier candidates (a 127.0.0.1 entry among
+					// them), and a key prompt without a target is ambiguous.
+					message: `Lemonade API key for ${baseUrl} (leave empty if server doesn't require auth)`,
+				});
+				// Probe (warn-and-save): the server may be down at login time,
+				// and the pre-URL login stored the key unprobed — a failed
+				// probe reports but does not abort the login.
+				try {
+					const res = await fetch(`${baseUrl}/v1/models`, {
+						headers: {
+							Authorization: `Bearer ${key.trim() || PLACEHOLDER_API_KEY}`,
+						},
+						signal: AbortSignal.any([
+							interaction.signal,
+							AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+						]),
+				});
+					if (!res.ok) throw new Error(`HTTP ${res.status}`);
+				} catch (err) {
+					if (!interaction.signal.aborted) {
+						interaction.notify({
+							type: "info",
+							message:
+								`Lemonade server at ${baseUrl} is not reachable yet ` +
+								`(${err instanceof Error ? err.message : String(err)}) — storing the configuration anyway.`,
+						});
+					}
+				}
+				return {
+					type: "api_key",
+					key: key || PLACEHOLDER_API_KEY,
+					env: { LEMONADE_BASE_URL: baseUrl },
+				};
+			},
 				async resolve({ ctx, credential }): Promise<AuthResult | undefined> {
 					// read the key through the injected AuthContext.env DI surface
 					// (works in browsers and Node test harnesses), keeping process.env
@@ -1177,11 +1737,28 @@ export default async function (pi: ExtensionAPI) {
 						apiKeyEnv ?? procEnv?.LEMONADE_API_KEY,
 						adminApiKeyEnv ?? procEnv?.LEMONADE_ADMIN_API_KEY,
 					);
+					// The credential's server URL (stored by /login) overrides the
+					// env-derived base for live requests: pi's applyAuth replaces
+					// model.baseUrl with auth.baseUrl before the provider is called,
+					// and the OpenAI client dials model.baseUrl. It is returned only
+					// when the credential carries one — always returning the env base
+					// would clobber a per-model models.json baseUrl override.
+					const credentialUrl = credentialBaseUrl(credential);
 					// `AuthResult.auth.apiKey` is what pi attaches to requests as
 					// Authorization: Bearer <key>. The key must be nested under `auth`,
 					// not returned at the top level of the result.
 					return {
-						auth: { apiKey: resolved.apiKey },
+						auth: {
+							apiKey: resolved.apiKey,
+							...(credentialUrl ? { baseUrl: `${credentialUrl}/v1` } : {}),
+						},
+						// The URL must ALSO ride in `env`: pi's post-login catalog
+						// refresh rebuilds the refresh credential from
+						// `result.auth.apiKey` + `result.env` only (auth.baseUrl is
+						// not part of it) — without this, the refresh after /login
+						// discovers from the env base (the local server) instead of
+						// the server that was just logged in.
+						...(credentialUrl ? { env: { LEMONADE_BASE_URL: credentialUrl } } : {}),
 						source: resolved.source,
 					};
 				},
@@ -1190,8 +1767,12 @@ export default async function (pi: ExtensionAPI) {
 		getModels: () => currentModels,
 		/** Live re-discovery: pi calls this during model refresh and /reload,
 		 *  so new downloads appear without a process restart. On a discovery
-		 *  failure it returns early (no throw) so the last-known-good catalog
-		 *  — or the initial baseline — is retained instead of being replaced.
+		 *  failure the last-known-good catalog is retained (the restore phase
+		 *  above already published it) and the error is THROWN — pi records it
+		 *  and shows its standard "using cached models" warning (the built-in
+		 *  dynamic providers do the same: llama.cpp's refreshModels throws on
+		 *  a server-down list). A reachable-but-empty server is not a failure:
+		 *  it publishes an honest empty catalog.
 		 *
 		 *  Dual-compatible: pi 0.83 uses context.store.read/write;
 		 *  pi 0.84+ uses context.stored (read-only snapshot) +
@@ -1230,7 +1811,16 @@ export default async function (pi: ExtensionAPI) {
 				}
 			} else {
 				// pi 0.83: context.store.read() is async (property absent in 0.84+ types).
-				const stored = await ctx.store.read();
+				// A corrupted store file can make read() itself throw (JSON.parse)
+				// — guard it the way the 0.84 branch guards a non-array
+				// `stored.models`: keep the last-known-good catalog, warn once.
+				let stored: { models?: unknown } | undefined;
+				try {
+					stored = await ctx.store.read();
+				} catch {
+					warnStoreCorruption();
+					stored = undefined;
+				}
 				if (stored) {
 					if (Array.isArray(stored.models)) {
 						currentModels = stored.models.filter(
@@ -1246,21 +1836,34 @@ export default async function (pi: ExtensionAPI) {
 
 			if (!context.allowNetwork || context.signal?.aborted) return;
 
-			// Thread the `/login lemonade` credential's bearer into discovery so
-			// a key stored via /login authenticates refresh requests too.
-			const credentialKey =
-				context.credential?.type === "api_key" ? context.credential.key : undefined;
+			// Thread the `/login lemonade` credential into discovery: the bearer
+			// authenticates the refresh requests, and the stored server URL (if
+			// any) overrides the env-derived base — the same precedence live
+			// requests get through `auth.baseUrl`.
+			const credential =
+				context.credential?.type === "api_key" ? context.credential : undefined;
+			const credentialUrl = credentialBaseUrl(credential);
+			const discoveryConfig = credentialUrl
+				? { ...config, baseUrl: credentialUrl }
+				: config;
 			const { models, error } = await discoverModels(
-				config,
+				discoveryConfig,
 				fetch,
 				context.signal,
-				credentialKey,
+				credential?.key,
 			);
-			// A genuine failure keeps the last-known-good catalog. A reachable server
-			// with nothing usable yields `models: []` without an error, and that empty
-			// list is published below — deleting every model really does clear pi's list.
-			if (error) return;
 			if (context.signal?.aborted) return;
+			// A genuine failure keeps the last-known-good catalog (the restore
+			// phase above already published it) — but THROW it, the way pi's
+			// built-in dynamic providers do (llama.cpp's refreshModels has no
+			// try/catch): pi records the error and the TUI shows its standard
+			// "…model catalog could not be refreshed; using cached models"
+			// warning. Swallowing the failure made pi treat the refresh as
+			// successful, so the stale list appeared with no explanation.
+			// A reachable server with nothing usable yields `models: []`
+			// without an error, and that empty list is published below —
+			// deleting every model really does clear pi's list.
+			if (error) throw new Error(error);
 
 			if (hasPublish) {
 				// pi persists the entry, re-checks the refresh generation, and only then
@@ -1284,17 +1887,21 @@ export default async function (pi: ExtensionAPI) {
 				currentModels = models;
 			}
 		},
-		// The streaming backend is selected per request by the
-		// `x-pi-provider-lemonade` header (see the backend-switch section):
-		// "openai-completions" dispatches to pi's own built-in implementation
-		// — a pure pass-through, because the host passes its own native
-		// context shape and its own adapter consumes it, so no transcript
-		// normalization or Lemonade retry tuning applies there; anything else
-		// uses this extension's fork with its Lemonade error reporting. The
-		// retry defaults below are defaults only — an explicit caller-supplied
+		// The streaming implementation is selected by `streamingMode` in
+		// pi-provider-lemonade.json (see the streaming-mode-switch section):
+		// "builtin" ("openai-completions") dispatches to pi's own built-in
+		// implementation — a pure pass-through, because the host passes its
+		// own native context shape and its own adapter consumes it, so no
+		// transcript normalization or Lemonade retry tuning applies there;
+		// "extension" (default) uses this extension's fork with its Lemonade
+		// error reporting. When the file does not set it, the deprecated
+		// `x-pi-provider-lemonade` header decides per request. The retry
+		// defaults below are defaults only — an explicit caller-supplied
 		// `maxRetries` / `maxRetryDelayMs` (e.g. from Pi settings) wins.
 		stream: (model, context, options) =>
-			resolveCompletionsMode(options?.headers).mode === "openai-completions"
+			(fileStreamingMode ??
+				resolveCompletionsMode(options?.headers).mode) ===
+			"openai-completions"
 				? hostStream(model, context, options as ProviderStreamOptions)
 				: stream(model, context, {
 						...options,
@@ -1303,7 +1910,9 @@ export default async function (pi: ExtensionAPI) {
 							options?.maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS,
 					}),
 		streamSimple: (model, context, options) =>
-			resolveCompletionsMode(options?.headers).mode === "openai-completions"
+			(fileStreamingMode ??
+				resolveCompletionsMode(options?.headers).mode) ===
+			"openai-completions"
 				? hostStreamSimple(model, context, options)
 				: streamSimple(model, context, {
 						...options,
@@ -1313,20 +1922,17 @@ export default async function (pi: ExtensionAPI) {
 					}),
 	} as Provider<"openai-completions">);
 
-	// A transport failure registers the `discovery-failed` model and warns; an
+	// A transport failure registers the `discovery-failed` model — the model
+	// name itself is the signal, so there is no separate startup notice
+	// (the cause and remedy used to be warned here; the warning was removed
+	// because the model already communicates the problem). An
 	// empty-but-reachable server registers no models at all and reports the
 	// difference, so "nothing to run" is never mistaken for "server is down".
 	// Malformed configuration (e.g. an invalid port in `LEMONADE_HOST`, corrected
-	// in `readConfig`) is reported even when discovery succeeded — a silently
-	// replaced port otherwise looks like a "wrong server" error much later.
-	const notices: string[] = [...config.warnings];
-	if (initial.error) {
-		notices.push(
-			`Model discovery from ${config.baseUrl}/v1 failed (${initial.error}). ` +
-				`Registered provider "${config.provider}" with a single "discovery-failed" model. ` +
-				`Start the server and run /reload, or set LEMONADE_HOST/LEMONADE_PORT.`,
-		);
-	} else if (initial.empty) {
+	// in `readConfig`) is still reported — a silently replaced port otherwise
+	// looks like a "wrong server" error much later.
+	const notices: string[] = [...config.warnings, ...fileConfig.warnings];
+	if (initial.empty) {
 		notices.push(
 			`Lemonade at ${config.baseUrl}/v1 is reachable but has ` +
 				(initial.empty === "no-capable"
@@ -1335,10 +1941,10 @@ export default async function (pi: ExtensionAPI) {
 				`. Registered provider "${config.provider}" with no models — download one and run /reload.`,
 		);
 	}
-	// The discovery-notice handler is registered first, so consumers that
-	// take `session_start[0]` in a failing or empty discovery keep hitting
-	// it; the backend-switch handler below registers after it (and is the
-	// only one when discovery is healthy).
+	// When a discovery-notice handler is registered (config/file warnings or
+	// an empty catalog), it registers first; the backend-switch handler
+	// below registers after it (and is the only one when discovery is
+	// healthy or failed without warnings).
 	if (notices.length > 0) {
 		const message = notices.join(" ");
 		const level = initial.error ? "warning" : "info";
@@ -1348,11 +1954,15 @@ export default async function (pi: ExtensionAPI) {
 			"session_start",
 			// pi-lens-ignore: async-noise
 			async (_event: SessionStartEvent, ctx: ExtensionContext) => {
-				if (warned) return; // session_start also fires on reload/switch — warn once per process
+				if (warned) return; // session_start fires per session — warn once per extension load
 				warned = true;
 				if (ctx.hasUI) {
 					ctx.ui.notify(`[pi-provider-lemonade] ${message}`, level);
 				} else {
+					// Headless: console.warn (stderr) even for info-level
+					// notices — stdout may be piped to the consumer in
+					// `pi -p` mode, where extra output would corrupt the
+					// response, while stderr stays visible to the operator.
 					// pi-lens-ignore: no-console-except-error,console-statement
 					console.warn(`[pi-provider-lemonade] ${message}`);
 				}
@@ -1360,9 +1970,10 @@ export default async function (pi: ExtensionAPI) {
 		);
 	}
 
-	// Backend-switch notice + untested-pi warning (once per process). The
-	// header is read from the provider's composed auth (models.json
-	// `headers`) — the same value the per-request dispatch sees.
+	// Streaming-mode notice + deprecation warnings (once per extension load
+	// — the flag resets on /reload, which re-runs the factory). The header
+	// is read from the provider's composed auth (models.json `headers`) —
+	// the same value the per-request dispatch sees.
 	let warnedCompletions = false;
 	pi.on(
 		"session_start",
@@ -1370,26 +1981,47 @@ export default async function (pi: ExtensionAPI) {
 		async (_event: SessionStartEvent, ctx: ExtensionContext) => {
 			if (warnedCompletions) return; // session_start also fires on reload/switch
 			warnedCompletions = true;
-			const [piVersion, headerValue] = await Promise.all([
-				detectPiVersion(),
-				readCompletionsHeader(ctx, config.provider),
-			]);
+			const headerValue = await readCompletionsHeader(ctx, config.provider);
 			const notify = (text: string, level: "info" | "warning") => {
 				if (ctx.hasUI) {
 					ctx.ui.notify(`[pi-provider-lemonade] ${text}`, level);
 				} else {
+					// console.warn (stderr) for both levels — see the
+					// discovery-notice handler above for why.
 					// pi-lens-ignore: no-console-except-error,console-statement
 					console.warn(`[pi-provider-lemonade] ${text}`);
 				}
 			};
-			for (const warning of completionsWarnings(piVersion, headerValue)) {
+			for (const warning of completionsWarnings(headerValue)) {
 				notify(warning, "warning");
 			}
-			if (headerValue === "openai-completions") {
+			if (fileStreamingMode !== undefined) {
+				const headerMode = resolveCompletionsMode({
+					[COMPLETIONS_HEADER]: headerValue ?? null,
+				}).mode;
+				if (headerValue !== undefined && headerMode !== fileStreamingMode) {
+					notify(
+						`the models.json "${COMPLETIONS_HEADER}" header is ignored — "streamingMode" in ${EXTENSION_CONFIG_FILE} takes precedence`,
+						"warning",
+					);
+				}
+				if (fileStreamingMode === "openai-completions") {
+					notify(
+						`Streaming uses pi's built-in OpenAI-compatible backend (${EXTENSION_CONFIG_FILE} "streamingMode": "builtin").`,
+						"info",
+					);
+				}
+			} else if (headerValue !== undefined) {
 				notify(
-					`Streaming uses pi's built-in OpenAI-compatible backend (models.json "${COMPLETIONS_HEADER}": "openai-completions").`,
+					`the models.json "${COMPLETIONS_HEADER}" header is deprecated — set "streamingMode" in ${EXTENSION_CONFIG_FILE} instead`,
 					"info",
 				);
+				if (headerValue === "openai-completions") {
+					notify(
+						`Streaming uses pi's built-in OpenAI-compatible backend (models.json "${COMPLETIONS_HEADER}": "openai-completions").`,
+						"info",
+					);
+				}
 			}
 		},
 	);

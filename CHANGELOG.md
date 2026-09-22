@@ -5,6 +5,156 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-09-22
+
+### Added
+
+- **Multi-server `/login lemonade`**: `/login lemonade` now shows a
+  **server list** — the URL from a previous login (when one is stored),
+  the `LEMONADE_HOST`/`LEMONADE_PORT` base, and any servers found by the
+  local network scan (below) — each annotated with a live `online`/`offline`
+  status — plus **Scan local network…** and **Enter custom URL…**. The
+  selected server's URL and the API key (the prompt names the server you
+  picked) are stored in the credential, and the credential takes priority
+  over the environment for live requests and model refreshes — so a server
+  behind a reverse proxy (an `https://` URL, or one with a path prefix) can
+  be pointed at without touching the shell.
+- **Local network scan**: at pi startup (on by default on Linux only — on
+  macOS/Windows the scan's inbound UDP makes the OS firewall prompt about
+  the node process; override with `startupScan` in the configuration file)
+  the extension listens for the Lemonade Server's UDP beacon (port 13305,
+  the same mechanism as `lemonade scan`) and probes `127.0.0.1`, the default
+  gateway, and every address of your local RFC1918 subnets (prefix /24 or
+  smaller). The subnet sweep is the reliable path: the beacon is unusable
+  while a local Lemonade app runs (its sender socket holds the beacon port)
+  and a server may disable its beacon outright. The result is kept for the
+  session and offered in `/login`; **Scan local network…** (every platform)
+  re-runs it with a per-second countdown. When the scan finds nothing it
+  names the addresses it probed, so an empty result tells you exactly what
+  to check.
+- **`pi-provider-lemonade.json` configuration file** (in the agent
+  directory — `PI_CODING_AGENT_DIR`, or `~/.pi/agent` by default):
+  `discoveryTimeoutMs` (overall budget for one discovery pass, default
+  20000), `streamingMode` (`"extension"`, the default — this extension's
+  streaming layer; or `"builtin"` — pi's built-in OpenAI-compatible
+  streaming), and `startupScan` (force the startup scan on/off; the
+  platform default is Linux-only). All keys are optional; a missing file
+  means all defaults. The file takes precedence over the deprecated sources
+  (below), is re-read on every `/reload`, and a malformed file never blocks
+  startup — it is reported once and the defaults apply.
+- **Image input for vision models**: models whose `/api/show` reports the
+  `vision` capability are registered with `input: ["text", "image"]`, so
+  images pasted or dragged into the prompt reach the model as OpenAI
+  `image_url` content parts (the llama.cpp backend loads the `mmproj`
+  companion automatically).
+- **Per-model thinking level maps**: reasoning models expose a restricted
+  `off`/`medium` level map by default (`off` maps to
+  `reasoning_effort: "none"` — llama.cpp's hard per-request disable; `off`
+  is not a valid `reasoning_effort` value, which is why this does not copy
+  the built-in provider's `off: "off"`), and the builtin-model families
+  whose templates accept a graded effort get a wider per-model map:
+  **Qwen3.8** (`low`/`medium`/`xhigh` — its template enforces that strict
+  enum, so `minimal` and `high` are hidden as duplicates) and **gpt-oss** /
+  **Muse-Glimmer** (the full `none`/`minimal`/`low`/`medium`/`high` range;
+  `xhigh` is hidden).
+- **Builtin-model `thinkingFormat` heuristics**: ids from the Lemonade
+  builtin models catalog get the wire format their chat templates expect —
+  `qwen` for Qwen3.8 (its template reads `enable_thinking` and a strict
+  `reasoning_effort` enum), `qwen-chat-template` for the
+  `enable_thinking`-kwarg families (Qwen3/3.5/3.6, MiniCPM
+  4.1/5/V-4.5+/o-4.5, GLM-4.5/4.7, Nemotron-3, Ornith-1.5, DeepSeek-V4,
+  PromptBridge, SmolLM3, Gemma-4), `deepseek` for DeepSeek-R1-Distill, and
+  `chat-template` with `chat_template_kwargs` for LFM2.5 (`thinking`) and
+  Muse-Glimmer (`reasoning_strength`, rendered as a system-prompt
+  directive). The heuristics are best-effort and can misfire on a user
+  model that shares an id pattern with a builtin model but uses a different
+  template — override `compat.thinkingFormat` per-model in `models.json`
+  if needed.
+- **Capability-based reasoning detection**: `reasoning` is now derived from
+  the `/api/show` `thinking` capability instead of being hard-coded `true`
+  for every model. A server that reports `thinking` for no model at all is
+  assumed to predate the capability, so every model keeps the toggle; a
+  model with no capability and no matching family gets
+  `reasoning: false` (selector hidden, no thinking parameters sent).
+- **Builtin-models reasoning fallback**: the catalog labels only some
+  thinking-capable builtin models as `reasoning`, so a builtin model with a
+  verified template toggle now gets `reasoning: true` automatically — 31
+  models that would otherwise ship with the selector hidden. The matching
+  `thinkingFormat` hint is already in `compat`, so no override is needed.
+- **pi 0.87 support**: the extension is now verified through pi 0.87 (the
+  `@earendil-works/pi-ai` dependency is pinned to 0.87.x).
+
+### Changed
+
+- **The provider is named `Lemonade`** (previously `Lemonade (<host>)`):
+  the host in the name went stale after logging into a different server,
+  and pi uses the provider name for the login dialog title.
+- **No discovery-failure startup warning**: the single `discovery-failed`
+  fallback model is the signal. Configuration warnings and the
+  reachable-but-empty catalog notice are unchanged.
+- **A failed model refresh now throws**, the way pi's built-in dynamic
+  providers do: the last-known-good catalog is retained, and pi shows its
+  standard "model catalog could not be refreshed; using cached models"
+  warning instead of silently keeping the stale list.
+- **`responseModel` no longer strips the `huggingface/hub/` prefix** from
+  the server's raw model value — the full GGUF cache path that served the
+  response is visible in diagnostics.
+- **The pi-version detection and untested-pi startup warning are removed** —
+  the streaming-mode escape hatch (`streamingMode: "builtin"`) is
+  documented in the README instead.
+
+### Fixed
+
+- **Post-login catalog refresh hit the wrong server**: pi rebuilds the
+  refresh credential from `resolve()`'s `auth.apiKey` + `env` only —
+  `auth.baseUrl` is not part of that reconstruction — and the stored server
+  URL rode solely in `auth.baseUrl`. After logging into a remote server,
+  the refresh therefore re-discovered from the env base (the local one),
+  and `/model` kept showing the local models while requests went to the
+  remote (which answered `model_not_found` for every local model name). The
+  URL now also rides in `AuthResult.env`, which pi passes into the refresh
+  credential.
+- A 200 `/v1/models` whose body was not a models payload (a proxy error
+  page, a misrouted response) was reported as an *empty* catalog instead of
+  a discovery failure.
+- A truncated `models-store.json` entry made the pi 0.83 refresh reject
+  with an opaque `SyntaxError`; a bad entry is now guarded like the
+  non-array case (last-known-good catalog kept, one-time console warning).
+- A negative `retry-after-ms` header, or a past HTTP date in
+  `retry-after`, parsed to a non-positive delay and caused an immediate
+  retry with no backoff; both now fall back to the exponential schedule.
+  The `maxRetryDelayMs` cap is now applied to server-requested delays
+  unconditionally (a caller-supplied `0` means "no delays at all").
+- Tool-call chunks that carry neither an index nor an id (some backends
+  send the id only on the first chunk) created a duplicate tool-call block
+  per continuation chunk; they are now appended to the most recent
+  tool-call block. Interrupted tool-call blocks no longer leave a dangling
+  `streamIndex` in the final message content.
+- A whitespace-only `LEMONADE_PORT` is treated as unset (no warning),
+  matching the API-key handling; a whitespace-padded
+  `LEMONADE_API_KEY`/`LEMONADE_ADMIN_API_KEY` is trimmed before use (a
+  padded key never matches the server's stored value).
+- `LEMONADE_DISCOVERY_TIMEOUT_MS` accepts base-10 digits only (previously
+  `0x10`/`1e3` were accepted via `Number()`).
+- `samplingParams` overrides of the structurally reserved keys (`stream`,
+  `model`, `messages`) are skipped in the merge instead of corrupting the
+  request.
+- `streamSimple` no longer throws synchronously when the API key is
+  missing — the error surfaces as an error event, like `stream`.
+- The full Lemonade error shape (`details.code`/`backend`/`reason`) is
+  reported when the retry budget is exhausted, not just the abbreviated
+  message.
+
+### Deprecated
+
+- **`LEMONADE_DISCOVERY_TIMEOUT_MS` environment variable** — use
+  `discoveryTimeoutMs` in `pi-provider-lemonade.json`. Still honored when
+  the file does not set the key; a one-time startup notice points at the
+  replacement.
+- **The `x-pi-provider-lemonade` models.json header** — use `streamingMode`
+  in `pi-provider-lemonade.json`. Still honored when the file does not set
+  the key; a one-time startup notice points at the replacement.
+
 ## [1.2.0] - 2026-09-20
 
 ### Added
@@ -331,6 +481,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because Lemonade expects a `"system"` role rather than `"developer"`.
 - **HTTPS not supported** — the base URL always uses `http://`.
 
+[1.3.0]: https://github.com/okulev/pi-provider-lemonade/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/okulev/pi-provider-lemonade/compare/v1.1.3...v1.2.0
 [1.1.3]: https://github.com/okulev/pi-provider-lemonade/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/okulev/pi-provider-lemonade/compare/v1.1.1...v1.1.2

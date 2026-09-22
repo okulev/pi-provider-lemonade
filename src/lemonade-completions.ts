@@ -108,6 +108,35 @@ function formatLemonadeError(err: LemonadeErrorShape): string {
 }
 
 /**
+ * Resolve the terminal error message for a thrown error.
+ *
+ * The OpenAI SDK nests the raw Lemonade error shape under `error.error`
+ * (SSE: data: {"error": {...}}), and the synthetic "Lemonade mid-stream"
+ * error from the defensive `isLemonadeErrorChunk` branch does the same —
+ * both are formatted from the shape so every diagnostic field
+ * (status_code, type, code, details.*) survives. The synthetic error's own
+ * message only names message/status/code, so it is used only as the
+ * "retries exhausted" prefix, not as the report itself (the old guard
+ * skipped formatting for it, which dropped `details.*` on that path).
+ * Anything without a nested shape falls back to the plain message.
+ */
+export function terminalErrorMessage(error: unknown): string {
+	const lemonadeError = (error as { error?: LemonadeErrorShape })?.error;
+	if (
+		lemonadeError &&
+		typeof lemonadeError === "object" &&
+		"message" in lemonadeError
+	) {
+		const synthetic =
+			error instanceof Error && error.message.startsWith("Lemonade mid-stream");
+		return synthetic
+			? `Retries exhausted: ${formatLemonadeError(lemonadeError)}`
+			: formatLemonadeError(lemonadeError);
+	}
+	return error instanceof Error ? error.message : String(error);
+}
+
+/**
  * Check if a chunk is a Lemonade error event.
  *
  * Lemonade emits errors as SSE events: `data: {"error": {...}}`
@@ -167,8 +196,6 @@ function isRetryableError(err: LemonadeErrorShape): boolean {
 }
 
 // ── Retry utilities (from provider-retry.ts, reimplemented) ─────────────────
-
-const HF_HUB_PREFIX_RE = /^\/.*\/huggingface\/hub\//;
 
 /** Exponential backoff with jitter, matching provider-retry.ts, capped per step. */
 function getRetryDelayMs(
@@ -258,9 +285,18 @@ function isRetryableHttpError(error: ProviderHttpError): boolean {
 }
 
 /**
- * A server-requested delay above `maxRetryDelayMs` fails instead of sleeping:
- * a backend asking for ten minutes would hold the whole agent turn open
- * (pi-ai parity).
+ * Validate a server-requested delay against `maxRetryDelayMs`.
+ *
+ * A delay above `maxRetryDelayMs` fails instead of sleeping: a backend
+ * asking for ten minutes would hold the whole agent turn open (pi-ai
+ * parity). The cap always applies — a caller-supplied 0 means "no delays
+ * at all" (matching getRetryDelayMs, which floors the exponential backoff
+ * at 0 too), not "unlimited". A negative delay is invalid by contract and
+ * fails as well: it would clamp to a 0 ms sleep and collapse the backoff
+ * into an instant retry. Both call sites in `getHttpRetryDelayMs` already
+ * normalize their negative cases to the exponential schedule before calling
+ * here, so this is defense-in-depth against a future caller forgetting the
+ * guard.
  */
 function validateServerRetryDelayMs(
 	delayMs: number,
@@ -268,7 +304,12 @@ function validateServerRetryDelayMs(
 	providerErrorMessage: string,
 ): number {
 	const maxDelayMs = maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS;
-	if (maxDelayMs > 0 && delayMs > maxDelayMs) {
+	if (delayMs < 0) {
+		throw new Error(
+			`Server requested a negative retry delay (${delayMs}ms). ${providerErrorMessage}`,
+		);
+	}
+	if (delayMs > maxDelayMs) {
 		throw new Error(
 			`Server requested ${Math.ceil(delayMs / 1000)}s retry delay (max: ${Math.ceil(maxDelayMs / 1000)}s). ${providerErrorMessage}`,
 		);
@@ -278,7 +319,10 @@ function validateServerRetryDelayMs(
 
 /**
  * `retry-after-ms` → `retry-after` (seconds or HTTP date) → exponential
- * backoff, all capped by `maxRetryDelayMs`.
+ * backoff, all capped by `maxRetryDelayMs`. A value that cannot be honoured
+ * (garbage, or negative — a negative delay would clamp to a 0 ms sleep and
+ * collapse the whole backoff into an instant retry) falls through to the
+ * next source, like the `retry-after` garbage/past-date cases below.
  */
 function getHttpRetryDelayMs(
 	error: ProviderHttpError,
@@ -288,7 +332,7 @@ function getHttpRetryDelayMs(
 	const retryAfterMs = error.headers?.get("retry-after-ms");
 	if (retryAfterMs) {
 		const value = Number.parseFloat(retryAfterMs);
-		if (!Number.isNaN(value)) {
+		if (!Number.isNaN(value) && value >= 0) {
 			return validateServerRetryDelayMs(
 				value,
 				maxRetryDelayMs,
@@ -303,10 +347,12 @@ function getHttpRetryDelayMs(
 		let delayMs = Number.isNaN(seconds)
 			? Date.parse(retryAfter) - Date.now()
 			: seconds * 1000;
-		// A value that is neither seconds nor an HTTP date parses to NaN;
-		// left as-is it becomes a 0 ms delay (setTimeout(NaN) fires
-		// immediately), so fall back to the exponential schedule.
-		if (Number.isNaN(delayMs)) delayMs = getRetryDelayMs(retryIndex, maxRetryDelayMs);
+		// A value that is neither seconds nor an HTTP date parses to NaN, and
+		// a past HTTP date parses to a negative delay; both would become an
+		// immediate retry (setTimeout clamps to 0), so fall back to the
+		// exponential schedule.
+		if (!Number.isFinite(delayMs) || delayMs < 0)
+			delayMs = getRetryDelayMs(retryIndex, maxRetryDelayMs);
 		return validateServerRetryDelayMs(delayMs, maxRetryDelayMs, error.message);
 	}
 
@@ -867,6 +913,11 @@ function buildParams(
 		(params as any).stream_options = { include_usage: true };
 	}
 
+	// Faithful port of pi-ai: when the server *supports* the `store`
+	// parameter, explicitly opt out of OpenAI's persistent memory with
+	// `store: false`; when it does not, the parameter is omitted entirely
+	// (an unknown field would be rejected). `supportsStore: false` (the
+	// discovered-model default) therefore sends nothing.
 	if (compat.supportsStore) {
 		params.store = false;
 	}
@@ -926,12 +977,24 @@ function buildParams(
 	// `model.samplingParams` (models.json `modelOverrides.samplingParams`) is
 	// merged over by the per-request value — pi-ai does this merge in
 	// `buildBaseOptions`, which this fork bypasses, so it happens here instead.
+	// Structurally reserved keys are skipped: `stream` must stay true (this is
+	// a streaming request), `model` must stay the model id, and `messages` must
+	// stay the converted conversation — a samplingParams override of any of
+	// them would corrupt the request. No other key is filtered: an override of
+	// a fork-computed field (`tools`, `max_tokens`, `temperature`, …) silently
+	// wins — that is the documented escape hatch for backend-specific knobs,
+	// but it also means a stray `tools`/`max_tokens` entry clobbers the
+	// computed value (see the README's models.json note).
 	const samplingParams =
 		model.samplingParams || options?.samplingParams
 			? { ...model.samplingParams, ...options?.samplingParams }
 			: undefined;
 	if (samplingParams) {
-		Object.assign(params, samplingParams);
+		const reserved = new Set(["stream", "model", "messages"]);
+		const overrides = Object.fromEntries(
+				Object.entries(samplingParams).filter(([key]) => !reserved.has(key)),
+		);
+		Object.assign(params, overrides);
 	}
 
 	return params;
@@ -987,10 +1050,12 @@ function parseChunkUsage(
 	return usage;
 }
 
-function mapStopReason(
-	reason: ChatCompletionChunk.Choice["finish_reason"] | string,
-): { stopReason: AssistantMessage["stopReason"]; errorMessage?: string } {
-	if (reason === null) return { stopReason: "stop" };
+function mapStopReason(reason: string): {
+	stopReason: AssistantMessage["stopReason"];
+	errorMessage?: string;
+} {
+	// Only reachable with a truthy finish_reason: the chunk loop gates the call
+	// on `if (choice.finish_reason)`, so null/undefined never arrive here.
 	switch (reason) {
 		case "stop":
 		case "end":
@@ -1054,11 +1119,11 @@ const RETRY_SUPPRESSED_NOTE = " (retryable, but output had already started — n
  *
  * The pi-ai `convertMessages` this fork reuses is generation-dependent:
  * 0.84/0.85 read `context.systemPrompt` and silently drop `system`-role
- * messages in the list, while 0.86 reads the system messages in the list and
+ * messages in the list, while 0.86/0.87 reads the system messages in the list and
  * ignores `context.systemPrompt`. The fold below emits *both* encodings —
  * `systemPrompt` on the context **and** a synthetic leading system message —
  * so exactly one system prompt reaches the wire on any pi ≥ 0.83 runtime
- * with the 0.86.x local pi-ai this package pins. The current tool set
+ * with the 0.87.x local pi-ai this package pins. The current tool set
  * (replaying `toolsAdded`/`toolsRemoved` in transcript order) goes on
  * `context.tools`, which this fork's `buildParams` reads directly.
  */
@@ -1068,7 +1133,7 @@ const RETRY_SUPPRESSED_NOTE = " (retryable, but output had already started — n
  * `TranscriptContext` (prompt/tools carried by the transcript's system
  * messages), pi ≤ 0.85 passes the legacy context with `systemPrompt`/`tools`
  * on it. The intersection covers both, and the brand survives the fold
- * below, so the result stays a valid `TranscriptContext` for pi-ai's 0.86
+ * below, so the result stays a valid `TranscriptContext` for pi-ai's 0.87
  * `convertMessages` / `clampMaxTokensToContext`.
  */
 type ProviderContext = TranscriptContext & {
@@ -1308,6 +1373,7 @@ export const stream: StreamFunction<
 		let hasFinishReason = false;
 		const toolCallBlocksByIndex = new Map<number, StreamingToolCallBlock>();
 		const toolCallBlocksById = new Map<string, StreamingToolCallBlock>();
+		let lastToolCallBlock: StreamingToolCallBlock | undefined;
 		const blocks = output.content as StreamingBlock[];
 		const getContentIndex = (block: StreamingBlock) => blocks.indexOf(block);
 
@@ -1385,6 +1451,13 @@ export const stream: StreamFunction<
 			if (!block && toolCall.id) {
 				block = toolCallBlocksById.get(toolCall.id);
 			}
+			if (!block && streamIndex === undefined && !toolCall.id) {
+				// A continuation chunk carrying neither index nor id (some
+				// OpenAI-compatible backends send the id only on the first
+				// chunk) would otherwise create a duplicate block per chunk —
+				// append to the most recent tool call instead.
+				block = lastToolCallBlock;
+			}
 			if (!block) {
 				block = {
 					type: "toolCall",
@@ -1410,6 +1483,7 @@ export const stream: StreamFunction<
 			}
 			if (toolCall.id) toolCallBlocksById.set(toolCall.id, block);
 			if (!block.name && name) block.name = name;
+			lastToolCallBlock = block;
 			return block;
 		};
 
@@ -1457,15 +1531,7 @@ export const stream: StreamFunction<
 				typedChunk.model.length > 0 &&
 				typedChunk.model !== model.id
 			) {
-				const serverModel = typedChunk.model;
-				// Lemonade may return the full GGUF cache path;
-				// strip `/*/huggingface/hub/` prefix for readability.
-				const match = serverModel.match(HF_HUB_PREFIX_RE);
-				const resolvedModel =
-					match
-						? serverModel.slice((match.index ?? 0) + match[0].length)
-						: serverModel;
-				output.responseModel ||= resolvedModel;
+				output.responseModel ||= typedChunk.model;
 			}
 			if (typedChunk.usage) {
 				output.usage = parseChunkUsage(typedChunk.usage, model);
@@ -1570,7 +1636,10 @@ export const stream: StreamFunction<
 		if (options?.signal?.aborted) {
 			throw new Error("Request was aborted");
 		}
-
+		// Unreachable at runtime ("aborted" is only assigned in the catch
+		// below, which always throws) — but it narrows the mutable
+		// `output.stopReason` union for the `done` event below, whose
+		// `reason` does not include "aborted".
 		if (output.stopReason === "aborted") {
 			throw new Error("Request was aborted");
 		}
@@ -1625,37 +1694,21 @@ export const stream: StreamFunction<
 				},
 			});
 		} catch (error) {
-			// Clean up partial content blocks
+			// Clean up partial content blocks — mirror finishBlock, which
+			// clears both streaming scratch fields on a completed tool call.
 			const partial = output.content;
 			for (const block of partial) {
 				// pi-lens-ignore: ts-delete-property
-				delete (block as { index?: number }).index;
-				// pi-lens-ignore: ts-delete-property
 				delete (block as { partialArgs?: string }).partialArgs;
+				// pi-lens-ignore: ts-delete-property
+				delete (block as { streamIndex?: number }).streamIndex;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			if (!output.errorMessage) {
-				// OpenAI SDK throws APIError with the raw Lemonade error shape
-				// in `error.error` (SSE: data: {"error": {...}}). Extract and
-				// format with full diagnostic fields (status_code, type, etc).
-				const lemonadeError = (error as { error?: LemonadeErrorShape })?.error;
-				if (
-					lemonadeError &&
-					typeof lemonadeError === "object" &&
-					"message" in lemonadeError &&
-					// the mid-stream SSE branch above may already have formatted
-					// this; avoid double-formatting its synthetic Error.
-					!(
-						error instanceof Error && error.message.startsWith("Lemonade mid-stream")
-					)
-				) {
-					output.errorMessage = formatLemonadeError(
-						lemonadeError as LemonadeErrorShape,
-					);
-				} else {
-					output.errorMessage =
-						error instanceof Error ? error.message : String(error);
-				}
+				// `error.error` carries the raw Lemonade shape (the SDK's
+				// APIError and the defensive synthetic mid-stream error) —
+				// `terminalErrorMessage` formats it with full diagnostics.
+				output.errorMessage = terminalErrorMessage(error);
 				if (
 					retrySuppressed &&
 					!output.errorMessage?.endsWith(RETRY_SUPPRESSED_NOTE)
@@ -1683,11 +1736,9 @@ export const streamSimple: StreamFunction<
 	context: ProviderContext,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream => {
-	getClientApiKey(
-		model.provider,
-		options?.apiKey,
-		options?.headers as Record<string, string | null> | undefined,
-	);
-
+	// No fail-fast key check here: `stream`'s `executeStream` runs the same
+	// `getClientApiKey` check, and its error surfaces as an error event —
+	// a synchronous throw here would make `streamSimple` behave differently
+	// from `stream` for the same missing-key condition.
 	return stream(model, context, { ...options } as LemonadeCompletionsOptions);
 };
