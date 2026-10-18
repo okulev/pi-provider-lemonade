@@ -119,6 +119,9 @@ export function builtinModelsCompatHints(id: string): BuiltinModelsCompatHints |
  * - Muse-Glimmer — `reasoning_strength` is a free-form string (default
  *   `high`): the same range as gpt-oss, delivered through
  *   `chatTemplateKwargs` (see `builtinModelsCompatHints`).
+ * - Jan — always-on with no off-switch (all three disable paths verified
+ *   inert), but it genuinely reasons: a medium-only map, so the selector
+ *   shows a read-only "thinking: medium" instead of a dead "off".
  */
 export function builtinModelsThinkingLevelMap(id: string): ThinkingLevelMap | undefined {
 	const n = id.toLowerCase();
@@ -142,6 +145,27 @@ export function builtinModelsThinkingLevelMap(id: string): ThinkingLevelMap | un
 			xhigh: null,
 		};
 	}
+	if (/^jan-(v1|nano)/.test(n)) {
+		// Jan is always-on (no off-switch — verified inert for
+		// reasoning_effort:"none", enable_thinking:false, and /no_think)
+		// but it genuinely reasons (the server streams reasoning_content).
+		// Expose only "medium" as a read-only indicator; an "off" option
+		// would be a lie (it cannot be disabled).
+		//
+		// The Jan family is NOT internally consistent: only the v1 and nano
+		// lineages prime `think`. Jan-v3.5-4B and Jan-code-4b use a plain
+		// chat+tools template with no thinking structure at all, so they are
+		// deliberately excluded (a false positive would show a selector on a
+		// model that never thinks).
+		return {
+			off: null,
+			minimal: null,
+			low: null,
+			medium: "medium",
+			high: null,
+			xhigh: null,
+		};
+	}
 	return undefined;
 }
 
@@ -158,10 +182,26 @@ export function builtinModelsThinkingLevelMap(id: string): ThinkingLevelMap | un
  * - Qwen3 Instruct-2507 / Coder / Next / VL — non-thinking only
  * - Qwen2.5 and older — no thinking
  * - MiniCPM3 / 4-8B / V-4 / o-2.6 — no kwarg in the template
- * - DeepSeek-R1-Distill — static always-on
- * - Bonsai, Jan, Muse-Glimmer, Phi-4-mini-reasoning — static always-on
- * - gpt-oss — the GGUF variants are catalog-labelled; the ONNX variant's
- *   backend does no thinking handling
+ * - DeepSeek-R1-Distill — static always-on (catalog-labelled `reasoning`,
+ *   so it gets the selector from the capability, not this fallback)
+ * - Bonsai — static always-on template, but the served Q1_0 quantization
+ *   doesn't follow the `think` priming (no thinking generated to display)
+ * - Phi-4-mini-reasoning — static always-on (catalog-labelled `reasoning`)
+ * - gpt-oss — the GGUF variants are catalog-labelled; the ONNX (ryzenai)
+ *   variant is a pure proxy to the external AMD runtime with no
+ *   thinking-handling code in the Lemonade path (external runtime
+ *   unverified)
+ *
+ * Jan is the one static-always-on family that IS included — but only the
+ * `v1` and `nano` lineages (`/^jan-(v1|nano)/`), which genuinely reason
+ * (the server streams `reasoning_content`) with no off-switch (verified
+ * inert for `reasoning_effort:"none"`, `enable_thinking:false`, and
+ * `/no_think`). They are exposed with a medium-only `thinkingLevelMap`
+ * (see `builtinModelsThinkingLevelMap`) — a read-only "thinking: medium"
+ * indicator, since an "off" option would be a lie. The Jan family is NOT
+ * internally consistent: Jan-v3.5-4B and Jan-code-4b use a plain
+ * chat+tools template with no thinking structure, so they are excluded
+ * (a false positive would show a selector on a model that never thinks).
  *
  * All included families are verified in the fetched template of at least
  * one member (lemonade main @ 25a73ab, 2026-09-22). The catalog labels
@@ -182,6 +222,7 @@ export function isBuiltinModelsThinkingFamily(id: string): boolean {
 		/smollm3/.test(n) ||
 		/ornith/.test(n) ||
 		/gemma-?4/.test(n) ||
-		/cogito/.test(n)
+		/cogito/.test(n) ||
+		/^jan-(v1|nano)/.test(n)
 	);
 }

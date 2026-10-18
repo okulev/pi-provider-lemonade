@@ -5,6 +5,88 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-10-18
+
+### Added
+
+- **pi 1.x support** — the extension is now verified end-to-end against
+  pi 1.3.0 (GitHub release binary **and** npm install, live Lemonade server):
+  discovery/`--list-models`, thinking off/medium, tool-call round trip, and
+  vision round trip. Dependency pins move to `@earendil-works/pi-ai`
+  `~1.3.0` / `@earendil-works/pi-coding-agent` `~1.3.0` and `openai`
+  `7.19.0` (pi 1.3.0 parity).
+- **`samplingParamsByThinkingLevel` model override** (pi-ai 1.0.2 port,
+  [#9776](https://github.com/lemonade-sdk/lemonade/issues/9776)): per-model
+  sampling params keyed by thinking level (`off`…`max`) are resolved per
+  request after `samplingParams` and before request-time options, in
+  `models.json` `modelOverrides` just like for any other pi provider.
+- **pi-ai 1.3.0 fork ports**: thinking deltas are ordered before text when a
+  delta carries both
+  ([#10926](https://github.com/lemonade-sdk/lemonade/issues/10926)), and a
+  malformed final tool-call argument fails with an `argumentsError` event
+  instead of crashing the stream
+  ([#10944](https://github.com/lemonade-sdk/lemonade/issues/10944)).
+- **Discovery pre-filter**: the `/v1/models` `labels` field now serves as a
+  cheap oracle that skips the `/api/show` probe for entries that provably
+  cannot qualify (a non-chat deployment mode and no `tool-calling`
+  characteristic) — faster discovery on large catalogs. `/api/show` remains
+  the capability + context-length authority, and servers that send no labels
+  degrade to probe-everything as before.
+- **`refreshModels` honours provider-level `baseUrl`** (pi-ai 1.2.0): an
+  override in `models.json` wins over the `/login` credential, which wins
+  over the extension configuration — the same precedence as live requests.
+- **Chat models are stamped `type: "chat"`** (pi-ai 1.x added `type` to the
+  Model surface), future-proofing mixed catalogs for image/classifier model
+  types.
+- **Jan v1/nano thinking indicator**: the Jan `v1` and `nano` lineages are
+  always-on reasoners with no off-switch, so they expose a medium-only
+  thinking level map (a read-only "thinking: medium" selector instead of a
+  dead "off" option); other Jan lineages use a plain chat template and are
+  deliberately excluded.
+- **Builtin models catalog resync** (Lemonade v2026.40): 27 new chat models,
+  the `llamacpp-hrx` recipe, and `samplingParamsByThinkingLevel` emitted in
+  the generated models.json for the graded/free-form families (Qwen3.8,
+  gpt-oss, Muse-Glimmer).
+- **Offline mode handled honestly**: `lemond_offline` errors fail with a
+  single error event naming the offline cause — never a transport crash or a
+  retry storm — and discovery of already-downloaded models is unaffected.
+
+### Changed
+
+- **`@earendil-works/pi-ai` is now a `peerDependency` (`"*"`)** with a
+  `~1.3.0` devDependencies pin, instead of a runtime dependency. The pi host
+  bundles pi-ai and injects it into extensions; a private installed copy put
+  a second, differently-versioned pi-ai tree next to the host's and
+  triggered pi's host-provided-extension-packages warning. With the peer
+  declaration, managed installs skip it entirely and every import resolves
+  to the host's bundled copy — always generation-matched to the running pi.
+  The few pi-ai internals the streaming fork needs that pi-ai does not
+  root-export (`convertMessages`, the `simple-options` pair, the estimate
+  closure) are carried as verbatim, parity-tested copies in `src/pi-ai-compat/`
+  — the last `./api/*`/`./utils/*` subpath imports are gone.
+
+### Removed
+
+- **pi 0.83 runtime support** — the 0.84+ `stored`/`publish` refresh
+  contract is the only path (as first shipped in 1.1.0's dual-compat
+  transition).
+
+### Fixed
+
+- **Cancelled refreshes can no longer resolve with a half-queried catalog**:
+  an abort (pi's cancellation of `/reload` or an interrupting session) now
+  propagates through the parallel health check instead of being swallowed,
+  and skips the `/api/show` batches that have not started.
+- **A failing `/api/show` probe is no longer treated as "no usable models"**:
+  a probe failure (e.g. corrupt model metadata on the server) degrades to the
+  `discovery-failed` fallback (startup) or keeps the last-known-good catalog
+  (refresh), and the error names how many models failed and which — a catalog
+  that was fine a minute ago is never silently cleared.
+- **Startup discovery targets the `/login` credential's stored server URL**
+  (falling back to the `LEMONADE_HOST`/`LEMONADE_PORT` base), the same server
+  live requests and refreshes use — a credential pointing at a reverse-proxy
+  URL is honoured from the first launch.
+
 ## [1.3.0] - 2026-09-22
 
 ### Added
@@ -481,6 +563,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because Lemonade expects a `"system"` role rather than `"developer"`.
 - **HTTPS not supported** — the base URL always uses `http://`.
 
+[1.4.0]: https://github.com/okulev/pi-provider-lemonade/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/okulev/pi-provider-lemonade/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/okulev/pi-provider-lemonade/compare/v1.1.3...v1.2.0
 [1.1.3]: https://github.com/okulev/pi-provider-lemonade/compare/v1.1.2...v1.1.3

@@ -30,8 +30,25 @@ import type {
 	ToolCall,
 	TranscriptContext,
 } from "@earendil-works/pi-ai";
-import type { OpenAICompletionsOptions } from "@earendil-works/pi-ai/api/openai-completions";
-import { clampMaxTokensToContext } from "@earendil-works/pi-ai/api/simple-options";
+// convertMessages and OpenAICompletionsOptions are fork-owned copies
+// (src/pi-ai-compat/) — see that directory's provenance headers. Owning them
+// removes the last `./api/*` subpath imports so pi-ai can move to
+// peerDependencies (host-provided-packages warning).
+import {
+	convertMessages as sdkConvertMessages,
+	type OpenAICompletionsOptions,
+} from "./pi-ai-compat/convert-messages.ts";
+// clampMaxTokensToContext/resolveSamplingParams are fork-owned copies
+// (src/pi-ai-compat/) — see the P1b note in the directory's provenance
+// headers. parseToolCallArguments moves to the pi-ai ROOT entry (root-exported
+// since 1.3.0, upstream #10944), removing the last `./utils/*` subpath
+// import — the root specifier resolves host-side under pi in both install
+// modes.
+import {
+	clampMaxTokensToContext,
+	resolveSamplingParams,
+} from "./pi-ai-compat/simple-options.ts";
+import { parseToolCallArguments } from "@earendil-works/pi-ai";
 import {
 	type AssistantMessageEventStream,
 	calculateCost,
@@ -39,7 +56,6 @@ import {
 	createAssistantMessageEventStream,
 	parseStreamingJson,
 } from "@earendil-works/pi-ai";
-import { convertMessages as sdkConvertMessages } from "@earendil-works/pi-ai/api/openai-completions";
 
 /** Extended options for Lemonade completions with retry config. */
 export interface LemonadeCompletionsOptions extends OpenAICompletionsOptions {
@@ -367,7 +383,7 @@ interface HttpRetryOptions {
 
 /**
  * HTTP-level retry for the initial request — the equivalent of upstream pi's
- * `retryProviderRequest` (`@earendil-works/pi-ai/utils/provider-retry` is not
+ * `retryProviderRequest` (pi-ai's `provider-retry` module is not
  * exported from the package, so it is reproduced here). Without it, a plain
  * `429`/`5xx` JSON error (no Lemonade `error.status_code` in the body) was
  * fatal and `Retry-After` was ignored, because the SDK client is created with
@@ -831,7 +847,7 @@ function resolveChatTemplateKwargValue(
 
 /**
  * pi-ai's fixed prompt reserve (`CONTEXT_SAFETY_TOKENS` in
- * `pi-ai/api/simple-options`), used as the reserve for large context windows.
+ * pi-ai `simple-options`), used as the reserve for large context windows.
  */
 const PI_CONTEXT_SAFETY_TOKENS = 4096;
 /** Lower bound for the prompt reserve on small local context windows. */
@@ -924,7 +940,7 @@ function buildParams(
 
 	// `maxTokens` is derived from the model, not only from the request: pi-ai
 	// fills `options.maxTokens` from `model.maxTokens` in `buildBaseOptions`
-	// (`pi-ai/api/simple-options`), which the built-in `streamSimple` calls but
+	// (pi-ai `simple-options`), which the built-in `streamSimple` calls but
 	// this fork's does not (it delegates straight to `stream`). The agent loop
 	// never sets `options.maxTokens` for ordinary turns — only compaction does
 	// — so deriving it here is what makes `models.json` `modelOverrides.maxTokens`
@@ -974,21 +990,26 @@ function buildParams(
 	applyThinkingParams(params, model, options, compat);
 
 	// Last so custom keys override the named request fields.
-	// `model.samplingParams` (models.json `modelOverrides.samplingParams`) is
-	// merged over by the per-request value — pi-ai does this merge in
-	// `buildBaseOptions`, which this fork bypasses, so it happens here instead.
-	// Structurally reserved keys are skipped: `stream` must stay true (this is
-	// a streaming request), `model` must stay the model id, and `messages` must
-	// stay the converted conversation — a samplingParams override of any of
-	// them would corrupt the request. No other key is filtered: an override of
-	// a fork-computed field (`tools`, `max_tokens`, `temperature`, …) silently
-	// wins — that is the documented escape hatch for backend-specific knobs,
-	// but it also means a stray `tools`/`max_tokens` entry clobbers the
-	// computed value (see the README's models.json note).
-	const samplingParams =
-		model.samplingParams || options?.samplingParams
-			? { ...model.samplingParams, ...options?.samplingParams }
-			: undefined;
+	// `model.samplingParams` (models.json `modelOverrides.samplingParams`) and
+	// `model.samplingParamsByThinkingLevel` (pi-ai 1.0.2, #9776) are merged
+	// over by the per-request value — pi-ai does this merge in
+	// `buildBaseOptions`/`resolveSamplingParams`, which this fork bypasses, so
+	// the same resolution happens here. The level is the same one
+	// `applyThinkingParams` uses (unset/`off` → `"off"`), clamped through the
+	// model's thinking levels. Structurally reserved keys are skipped: `stream`
+	// must stay true (this is a streaming request), `model` must stay the model
+	// id, and `messages` must stay the converted conversation — a
+	// samplingParams override of any of them would corrupt the request. No
+	// other key is filtered: an override of a fork-computed field (`tools`,
+	// `max_tokens`, `temperature`, …) silently wins — that is the documented
+	// escape hatch for backend-specific knobs, but it also means a stray
+	// `tools`/`max_tokens` entry clobbers the computed value (see the README's
+	// models.json note).
+	const samplingParams = resolveSamplingParams(
+		model,
+		resolveReasoningEffort(model, options) ?? "off",
+		options?.samplingParams,
+	);
 	if (samplingParams) {
 		const reserved = new Set(["stream", "model", "messages"]);
 		const overrides = Object.fromEntries(
@@ -1122,7 +1143,7 @@ const RETRY_SUPPRESSED_NOTE = " (retryable, but output had already started — n
  * messages in the list, while 0.86/0.87 reads the system messages in the list and
  * ignores `context.systemPrompt`. The fold below emits *both* encodings —
  * `systemPrompt` on the context **and** a synthetic leading system message —
- * so exactly one system prompt reaches the wire on any pi ≥ 0.83 runtime
+ * so exactly one system prompt reaches the wire on any pi ≥ 0.84 runtime
  * with the 0.87.x local pi-ai this package pins. The current tool set
  * (replaying `toolsAdded`/`toolsRemoved` in transcript order) goes on
  * `context.tools`, which this fork's `buildParams` reads directly.
@@ -1167,7 +1188,7 @@ function systemMessageContent(message: TranscriptSystemMessage): string {
 }
 
 /**
- * Fold any pi ≥ 0.83 context into the dual-encoded shape described in the
+ * Fold any pi ≥ 0.84 context into the dual-encoded shape described in the
  * section header: one `systemPrompt` (all system-message content replayed in
  * transcript order, then the *final* state of their named sections —
  * replaced by name, `null` removes — matching pi-ai's own
@@ -1265,7 +1286,7 @@ export const stream: StreamFunction<
 	// Fold the context once per request: pi ≥ 0.86 sends a transcript context
 	// (prompt/tools carried by system messages in the transcript), pi ≤ 0.85
 	// sends the legacy `Context`. `buildParams` and pi-ai's `convertMessages`
-	// then see the same dual-encoded fields on every pi ≥ 0.83 (see the
+	// then see the same dual-encoded fields on every pi ≥ 0.84 (see the
 	// transcript normalization section above). No-op for prompt-less contexts.
 	context = normalizeTranscriptContext(context);
 
@@ -1395,7 +1416,13 @@ export const stream: StreamFunction<
 					partial: output,
 				});
 			} else if (block.type === "toolCall") {
-				block.arguments = parseStreamingJson(block.partialArgs);
+				// Upstream #10944/#10897: the FINAL parse must not keep the parsed
+				// prefix of malformed arguments — an unparseable tail fails the
+				// call with `argumentsError` (the raw arguments text rides along)
+				// so the model sees what it sent, instead of silently running the
+				// parsed prefix. The in-flight delta parse below keeps
+				// parseStreamingJson (partial JSON is expected there).
+				Object.assign(block, parseToolCallArguments(block.partialArgs));
 				// pi-lens-ignore: ts-delete-property
 				delete block.partialArgs;
 				// pi-lens-ignore: ts-delete-property
@@ -1551,22 +1578,9 @@ export const stream: StreamFunction<
 			}
 
 			if (choice.delta) {
-				// Text content
-				if (
-					choice.delta.content !== null &&
-					choice.delta.content !== undefined &&
-					choice.delta.content.length > 0
-				) {
-					const block = ensureTextBlock();
-					block.text += choice.delta.content;
-					eventStream.push({
-						type: "text_delta",
-						contentIndex: getContentIndex(block),
-						delta: choice.delta.content,
-						partial: output,
-					});
-				}
-
+				// Handle reasoning before content: some proxies/routers aggregate
+				// reasoning and the answer into one delta, and the thinking block
+				// must precede the text block (upstream fix #10926).
 				// Thinking/reasoning content
 				const deltaFields = choice.delta as Record<string, unknown>;
 				const reasoningFields = [
@@ -1592,6 +1606,22 @@ export const stream: StreamFunction<
 							partial: output,
 						});
 					}
+				}
+
+				// Text content (after reasoning — see the comment above)
+				if (
+					choice.delta.content !== null &&
+					choice.delta.content !== undefined &&
+					choice.delta.content.length > 0
+				) {
+					const block = ensureTextBlock();
+					block.text += choice.delta.content;
+					eventStream.push({
+						type: "text_delta",
+						contentIndex: getContentIndex(block),
+						delta: choice.delta.content,
+						partial: output,
+					});
 				}
 
 				// Tool calls

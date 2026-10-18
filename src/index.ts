@@ -400,12 +400,16 @@ export async function readExtensionConfig(
  * and the discovery-populated `capabilities`, `contextLength`, `pinned`,
  * `last_use`, `_showFailed`.
  *
+ * **Read since the D-5 label pre-filter:** `labels` — used only as a cheap
+ * oracle to skip `/api/show` probes for entries that provably cannot qualify
+ * (a non-chat deployment mode and no `tool-calling`); `/api/show` remains the
+ * capability + context-length authority.
+ *
  * **Documented payload, never read:** `created`, `object`, `owned_by`,
- * `checkpoint`, `size`, `suggested`, `update_available`, `labels`. They are
+ * `checkpoint`, `size`, `suggested`, `update_available`. They are
  * declared so the parsed payload stays typed (and the test fixture honest), not
  * because anything consults them — name labels and `update_available` were
- * dropped deliberately (they are not standard Lemonade fields) and capability
- * detection comes from `/api/show`, not `labels`.
+ * dropped deliberately (they are not standard Lemonade fields).
  */
 export interface LemonadeModel {
 	id: string;
@@ -439,8 +443,9 @@ export interface LemonadeModel {
 	suggested?: boolean;
 	/** Documented payload, never read (see the interface doc). */
 	update_available?: boolean;
-	/** Documented payload, never read: capability detection comes from `/api/show`,
-	 *  not from server-side labels (see the interface doc). */
+	/** Server-side capability/characteristic tags. Read only as the D-5
+	 *  pre-filter oracle (skip `/api/show` for provable non-chat entries);
+	 *  capability detection itself still comes from `/api/show`. */
 	labels?: string[];
 	/** Whether the model is currently pinned (from `GET /v1/health`).
 	 *  Populated during discovery; `true` models are sorted first. */
@@ -455,7 +460,8 @@ export interface LemonadeModel {
 }
 
 export interface LemonadeConfig {
-	/** Full API base URL ending in `/v1`. */
+	/** Server base URL (no `/v1`): discovery appends `/v1/models` etc. itself;
+	 *  the *provider* registration adds `/v1` for the OpenAI-compatible API. */
 	baseUrl: string;
 	/** API key sent as `Authorization: Bearer`. */
 	apiKey: string;
@@ -884,6 +890,10 @@ export function toModel(
 		api: "openai-completions",
 		provider: config.provider,
 		baseUrl: config.baseUrl + "/v1",
+		// Explicit `chat` type (pi-ai 1.x added `type` to the Model surface;
+		// chat is the default, but stating it future-proofs mixed catalogs
+		// once image/classifier models can appear — PLAN-2026-10-18 D-8).
+		type: "chat",
 		reasoning,
 		...(reasoning && {
 			// Default: only off and medium are exposed — the built-in
@@ -1027,11 +1037,16 @@ function composeSignal(
 
 /** Enrich models with `pinned` status from `GET /v1/health`. Models that
  *  appear in `all_models_loaded` get their `pinned` flag attached.
- *  On failure — including the discovery deadline elapsing — the health endpoint
- *  is treated as unavailable and models retain `pinned: undefined`. */
+ *  On ordinary failure the health endpoint is treated as unavailable and
+ *  models retain `pinned: undefined`. An abort (pi's cancellation or the
+ *  discovery deadline) is re-thrown, like `fetchOllamaShow`: health runs in
+ *  parallel with the `/api/show` pass, so a swallowed abort here could let an
+ *  aborted discovery resolve with a catalog (capabilities already complete,
+ *  final `throwIfAborted` already passed) instead of failing the pass. */
 async function fetchHealthEnrichment(
 	models: LemonadeModel[],
 	fetchUrl: DiscoveryFetch,
+	signal?: AbortSignal,
 ): Promise<LemonadeModel[]> {
 	try {
 		const res = await fetchUrl("/v1/health");
@@ -1055,7 +1070,13 @@ async function fetchHealthEnrichment(
 			}
 			return m;
 		});
-	} catch {
+	} catch (err) {
+		// A cancelled pass must surface: swallowing the abort would resolve the
+		// whole discovery with a catalog enriched from a request the caller
+		// already cancelled. Ordinary failures stay graceful (best-effort).
+		if (signal?.aborted) {
+			throw signal.reason instanceof Error ? signal.reason : err;
+		}
 		return models;
 	}
 }
@@ -1151,6 +1172,53 @@ async function fetchOllamaShow(
  *  model is later excluded by `isChatCompletionLLM`). Throws only when the
  *  discovery `signal` aborts — a partially-queried catalog must not be
  *  published as if it were complete. */
+/** Deployment-mode labels from the `/v1/models` `labels` field (Lemonade docs,
+ *  "Model Labels"): exactly one per model names which backend endpoint the
+ *  model is routed to. Only `chat` models can qualify for registration. */
+const DEPLOYMENT_LABELS = new Set([
+	"chat",
+	"transcription",
+	"embeddings",
+	"embedding", // legacy alias accepted by the server
+	"reranking",
+	"reranker", // legacy alias accepted by the server
+	"image",
+	"tts",
+	"audio-generation",
+	"classification",
+	"classifier", // legacy alias accepted by the server
+	"3d",
+]);
+
+/** Recipes whose documented default deployment mode (used when a model
+ *  declares no deployment label at all) is NOT chat: sd-cpp → image,
+ *  whispercpp → transcription, kokoro → tts. An unknown recipe defaults to
+ *  "might be chat" — the pre-filter probes rather than skips. */
+const NON_CHAT_DEFAULT_RECIPES = new Set(["sd-cpp", "whispercpp", "kokoro"]);
+
+/** PLAN-2026-10-18 F-07/D-5 label pre-filter: can this entry be ruled out as a
+ *  chat-completions candidate from its `/v1/models` labels alone, so the
+ *  mandatory `/api/show` probe can be skipped? Conservative by design —
+ *  `/api/show` stays the capability + context-length authority and the
+ *  fallback when labels are absent (older servers degrade to
+ *  probe-everything). A model is skipped only when it provably cannot
+ *  qualify: a non-chat deployment mode (explicit label, or a recipe whose
+ *  documented default is non-chat) AND no `tool-calling` characteristic.
+ *  Missing labels alone never exclude a model. */
+function cannotQualifyViaLabels(m: LemonadeModel): boolean {
+	const labels = m.labels;
+	if (!Array.isArray(labels) || labels.length === 0) return false;
+	const hasDeploymentLabel = labels.some((l) => DEPLOYMENT_LABELS.has(l));
+	const chatClass = hasDeploymentLabel
+		? labels.includes("chat")
+		: !NON_CHAT_DEFAULT_RECIPES.has(m.recipe ?? "");
+	if (chatClass) return false; // might qualify — probe (/api/show decides)
+	// Not a chat deployment, but the plan's conjunction keeps any model that
+	// carries `tool-calling` in the probe set (never exclude on labels alone
+	// beyond the provable non-chat case).
+	return !labels.includes("tool-calling");
+}
+
 async function fetchOllamaCapabilities(
 	models: LemonadeModel[],
 	fetchUrl: DiscoveryFetch,
@@ -1298,9 +1366,15 @@ export async function discoverModels(
 		// 2. Fetch /v1/health to enrich with pinned status, and query
 		//    /api/show for capabilities — both in parallel.
 		//    Health failure is graceful (pinned stays undefined → sorted last).
+		//    The /api/show probe set is pre-filtered by the cheap `/v1/models`
+		//    labels oracle (PLAN-2026-10-18 F-07/D-5): entries that provably
+		//    cannot qualify are never probed; everything else — including every
+		//    label-less entry on an older server — is probed as before, and
+		//    `/api/show` remains the authority that decides inclusion.
+		const candidates = entries.filter((m) => !cannotQualifyViaLabels(m));
 		const [healthEnriched, showEnriched] = await Promise.all([
-			fetchHealthEnrichment(entries, fetchUrl),
-			fetchOllamaCapabilities(entries, fetchUrl, deadline.signal),
+			fetchHealthEnrichment(entries, fetchUrl, deadline.signal),
+			fetchOllamaCapabilities(candidates, fetchUrl, deadline.signal),
 		]);
 		const healthById = new Map(healthEnriched.map((h) => [h.id, h]));
 		entries = showEnriched.map((showEntry) => {
@@ -1321,14 +1395,39 @@ export async function discoverModels(
 		entries = entries.filter((m) => isChatCompletionLLM(m));
 		if (entries.length === 0) {
 			// Distinguish "nothing usable on a healthy server" from "we could not
-			// probe anything": a failed /api/show is not evidence of incapability, so
-			// a catalog that is empty only because every probe failed stays a discovery
-			// failure (startup registers `discovery-failed`, a refresh keeps the
-			// last-known-good catalog instead of clearing it).
-			if (showEnriched.some((m) => m._showFailed))
+			// probe everything": a failed /api/show is not evidence of incapability —
+			// the unprobed model may be the user's only chat model, and an
+			// honest-empty classification would clear (and persist) the catalog while
+			// reporting an info notice that never says "failed". A persistently
+			// failing probe (corrupt model metadata server-side, a server bug) would
+			// then hide that model with no signal at all. So ANY failed probe keeps
+			// this a discovery failure (startup registers `discovery-failed`, a
+			// refresh keeps the last-known-good catalog instead of clearing it), with
+			// a truthful message: a fully broken /api/show ("every downloaded
+			// model") is distinguished from a per-model failure ("K of N", naming
+			// the failed models — what a user needs to fix the server). Only when
+			// every probe succeeded and none of the models is chat-capable is the
+			// empty catalog honest.
+			const failed = showEnriched.filter((m) => m._showFailed);
+			if (failed.length > 0) {
+				const total = showEnriched.length;
+				const scope =
+					failed.length === total
+						? "every downloaded model"
+						: `${failed.length} of ${total} downloaded models`;
+				const names =
+					failed
+						.slice(0, 5)
+						.map((m) => m.id)
+						.join(", ") +
+					(failed.length > 5 ? `, +${failed.length - 5} more` : "");
 				throw new Error(
-					"/api/show failed for every downloaded model (no capabilities could be determined)",
+					`/api/show failed for ${scope}` +
+						(failed.length < total
+							? ` (${names}) — the remaining models report no chat capabilities`
+							: " (no capabilities could be determined)"),
 				);
+			}
 			return { models: [], empty: "no-capable" };
 		}
 
@@ -1493,7 +1592,21 @@ export default async function (pi: ExtensionAPI) {
 		});
 	}
 
-	const initial = await discoverModels(config, fetch);
+	// Startup discovery targets the server stored by a previous /login (if
+	// any) — the same precedence `refreshModels` (credential.env) and live
+	// requests (auth.baseUrl) apply. Without this, a user logged into a
+	// remote server would get the env server's catalog at startup and, on
+	// hosts that never auto-refresh, keep it for the whole session. Only the
+	// URL is read from auth.json — never the key; the key still resolves
+	// lazily through pi's auth system, so a key-required server can still
+	// fail initial discovery with HTTP 401 until the first refresh.
+	const savedServerUrl = await readSavedServerUrl(config.provider);
+	const discoveryBaseUrl = savedServerUrl ?? config.baseUrl;
+	const discoveryConfig =
+		discoveryBaseUrl === config.baseUrl
+			? config
+			: { ...config, baseUrl: discoveryBaseUrl };
+	const initial = await discoverModels(discoveryConfig, fetch);
 
 	// Current discovered catalog. `refreshModels` retains the last-known-good
 	// list on failure and persists successful fetches through the provider store.
@@ -1774,64 +1887,34 @@ export default async function (pi: ExtensionAPI) {
 		 *  a server-down list). A reachable-but-empty server is not a failure:
 		 *  it publishes an honest empty catalog.
 		 *
-		 *  Dual-compatible: pi 0.83 uses context.store.read/write;
-		 *  pi 0.84+ uses context.stored (read-only snapshot) +
-		 *  context.publish() (generation-checked transaction). */
+		 *  Uses the pi 0.84+ contract (read-only `context.stored` snapshot +
+		 *  generation-checked `context.publish()`); pi 0.83 runtime support
+		 *  (context.store.read/write) was dropped — see
+		 *  historical/PLAN-2026-10-18.md F-03/D-3. */
 		async refreshModels(
 			this: void,
 			context: RefreshModelsContext,
 		): Promise<void> {
-			// Detect pi 0.84+ API at runtime (publish function exists).
-			// pi-lens-ignore: no-as-any,no-any-type
-			const ctx = context as any;
-			const hasPublish = typeof ctx.publish === "function";
-
 			// Restore from persisted catalog. A corrupted entry (hand-edited or
 			// truncated models-store.json) must not throw out of the refresh:
 			// keep the last-known-good catalog and report the bad entry once.
-			if (hasPublish) {
-				// pi 0.84+: context.stored is a read-only ModelsStoreEntry snapshot.
-				const storedModels = ctx.stored?.models;
-				if (Array.isArray(storedModels)) {
-					const restored = storedModels.filter(
-						// pi-lens-ignore: no-any-type
-						(m: any): m is Model<"openai-completions"> =>
-							m.provider === config.provider && m.api === "openai-completions",
-					);
-					if (
-						!(await ctx.publish({
-							update: () => {
-								currentModels = restored;
-							},
-						}))
-					)
-						return;
-				} else if (ctx.stored) {
-					warnStoreCorruption();
-				}
-			} else {
-				// pi 0.83: context.store.read() is async (property absent in 0.84+ types).
-				// A corrupted store file can make read() itself throw (JSON.parse)
-				// — guard it the way the 0.84 branch guards a non-array
-				// `stored.models`: keep the last-known-good catalog, warn once.
-				let stored: { models?: unknown } | undefined;
-				try {
-					stored = await ctx.store.read();
-				} catch {
-					warnStoreCorruption();
-					stored = undefined;
-				}
-				if (stored) {
-					if (Array.isArray(stored.models)) {
-						currentModels = stored.models.filter(
-							// pi-lens-ignore: no-any-type
-							(m: any): m is Model<"openai-completions"> =>
-								m.provider === config.provider && m.api === "openai-completions",
-						);
-					} else {
-						warnStoreCorruption();
-					}
-				}
+			// `context.stored` is a read-only ModelsStoreEntry snapshot.
+			const storedModels = context.stored?.models;
+			if (Array.isArray(storedModels)) {
+				const restored = storedModels.filter(
+					(m): m is Model<"openai-completions"> =>
+						m.provider === config.provider && m.api === "openai-completions",
+				);
+				if (
+					!(await context.publish({
+						update: () => {
+							currentModels = restored;
+						},
+					}))
+				)
+					return;
+			} else if (context.stored) {
+				warnStoreCorruption();
 			}
 
 			if (!context.allowNetwork || context.signal?.aborted) return;
@@ -1843,9 +1926,23 @@ export default async function (pi: ExtensionAPI) {
 			const credential =
 				context.credential?.type === "api_key" ? context.credential : undefined;
 			const credentialUrl = credentialBaseUrl(credential);
-			const discoveryConfig = credentialUrl
-				? { ...config, baseUrl: credentialUrl }
-				: config;
+			// PLAN-2026-10-18 F-04/D-4: pi-ai 1.2.0 added `RefreshModelsContext.baseUrl`
+			// — the registered provider base URL including overrides that wrappers or
+			// models.json `providers.lemonade.baseUrl` apply OUTSIDE this extension.
+			// An override is a baseUrl that differs from our own env-derived config;
+			// when one is in play it must not be silently overridden by a stale saved
+			// `/login` credential URL. Precedence: saved credential URL, unless a
+			// models.json-level override exists → then `ctx.baseUrl`; else the
+			// env-derived config (a host that echoes our own baseUrl back changes
+			// nothing). Credential-URL per-model baseUrl behaviour is unchanged.
+			const overrideUrl =
+				typeof context.baseUrl === "string" &&
+				context.baseUrl.length > 0 &&
+				context.baseUrl !== config.baseUrl
+				? context.baseUrl
+				: undefined;
+			const discoveryBaseUrl = overrideUrl ?? credentialUrl ?? config.baseUrl;
+			const discoveryConfig = { ...config, baseUrl: discoveryBaseUrl };
 			const { models, error } = await discoverModels(
 				discoveryConfig,
 				fetch,
@@ -1865,27 +1962,20 @@ export default async function (pi: ExtensionAPI) {
 			// deleting every model really does clear pi's list.
 			if (error) throw new Error(error);
 
-			if (hasPublish) {
-				// pi persists the entry, re-checks the refresh generation, and only then
-				// calls `update`. Mutating `currentModels` **inside** `update` is what
-				// makes this transactional: assigning before `publish` let a refresh that
-				// lost the generation race overwrite the catalog a newer refresh had just
-				// published, in memory (and `update: () => { currentModels; }` was a
-				// no-op expression statement, so the publish path never assigned at all).
-				const published = await ctx.publish({
-					persist: { models, checkedAt: Date.now() },
-					update: () => {
-						currentModels = models;
-					},
-				});
-				// A newer refresh won: keep its in-memory catalog, change nothing.
-				if (!published) return;
-			} else {
-				// pi 0.83 has no generation check — persist first so a failing write
-				// leaves the in-memory catalog on the last-known-good list.
-				await ctx.store.write({ models, checkedAt: Date.now() });
-				currentModels = models;
-			}
+			// pi persists the entry, re-checks the refresh generation, and only then
+			// calls `update`. Mutating `currentModels` **inside** `update` is what
+			// makes this transactional: assigning before `publish` let a refresh that
+			// lost the generation race overwrite the catalog a newer refresh had just
+			// published, in memory (and `update: () => { currentModels; }` was a
+			// no-op expression statement, so the publish path never assigned at all).
+			const published = await context.publish({
+				persist: { models, checkedAt: Date.now() },
+				update: () => {
+					currentModels = models;
+				},
+			});
+			// A newer refresh won: keep its in-memory catalog, change nothing.
+			if (!published) return;
 		},
 		// The streaming implementation is selected by `streamingMode` in
 		// pi-provider-lemonade.json (see the streaming-mode-switch section):
@@ -1934,7 +2024,7 @@ export default async function (pi: ExtensionAPI) {
 	const notices: string[] = [...config.warnings, ...fileConfig.warnings];
 	if (initial.empty) {
 		notices.push(
-			`Lemonade at ${config.baseUrl}/v1 is reachable but has ` +
+			`Lemonade at ${discoveryBaseUrl}/v1 is reachable but has ` +
 				(initial.empty === "no-capable"
 					? "no model reporting the completion and tools capabilities"
 					: "no downloaded models") +
