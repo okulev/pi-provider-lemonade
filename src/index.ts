@@ -400,7 +400,7 @@ export async function readExtensionConfig(
  * and the discovery-populated `capabilities`, `contextLength`, `pinned`,
  * `last_use`, `_showFailed`.
  *
- * **Read since the D-5 label pre-filter:** `labels` — used only as a cheap
+ * **Read since the label pre-filter:** `labels` — used only as a cheap
  * oracle to skip `/api/show` probes for entries that provably cannot qualify
  * (a non-chat deployment mode and no `tool-calling`); `/api/show` remains the
  * capability + context-length authority.
@@ -443,7 +443,7 @@ export interface LemonadeModel {
 	suggested?: boolean;
 	/** Documented payload, never read (see the interface doc). */
 	update_available?: boolean;
-	/** Server-side capability/characteristic tags. Read only as the D-5
+	/** Server-side capability/characteristic tags. Read only as the
 	 *  pre-filter oracle (skip `/api/show` for provable non-chat entries);
 	 *  capability detection itself still comes from `/api/show`. */
 	labels?: string[];
@@ -892,7 +892,7 @@ export function toModel(
 		baseUrl: config.baseUrl + "/v1",
 		// Explicit `chat` type (pi-ai 1.x added `type` to the Model surface;
 		// chat is the default, but stating it future-proofs mixed catalogs
-		// once image/classifier models can appear — PLAN-2026-10-18 D-8).
+		// once image/classifier models can appear).
 		type: "chat",
 		reasoning,
 		...(reasoning && {
@@ -1196,7 +1196,7 @@ const DEPLOYMENT_LABELS = new Set([
  *  "might be chat" — the pre-filter probes rather than skips. */
 const NON_CHAT_DEFAULT_RECIPES = new Set(["sd-cpp", "whispercpp", "kokoro"]);
 
-/** PLAN-2026-10-18 F-07/D-5 label pre-filter: can this entry be ruled out as a
+/** Label pre-filter: can this entry be ruled out as a
  *  chat-completions candidate from its `/v1/models` labels alone, so the
  *  mandatory `/api/show` probe can be skipped? Conservative by design —
  *  `/api/show` stays the capability + context-length authority and the
@@ -1213,9 +1213,9 @@ function cannotQualifyViaLabels(m: LemonadeModel): boolean {
 		? labels.includes("chat")
 		: !NON_CHAT_DEFAULT_RECIPES.has(m.recipe ?? "");
 	if (chatClass) return false; // might qualify — probe (/api/show decides)
-	// Not a chat deployment, but the plan's conjunction keeps any model that
-	// carries `tool-calling` in the probe set (never exclude on labels alone
-	// beyond the provable non-chat case).
+	// Not a chat deployment, but the conjunction of both conditions keeps any
+	// model that carries `tool-calling` in the probe set (never exclude on
+	// labels alone beyond the provable non-chat case).
 	return !labels.includes("tool-calling");
 }
 
@@ -1289,7 +1289,6 @@ function throwIfAborted(signal?: AbortSignal): void {
  * `timeoutMs × ceil(models / 5)`. Aborting mid-pass degrades to the fallback
  * catalog rather than publishing a partially-queried one.
  */
-// pi-lens-ignore: long-parameter-list
 export async function discoverModels(
 	config: LemonadeConfig,
 	fetchImpl: typeof fetch = fetch,
@@ -1367,7 +1366,7 @@ export async function discoverModels(
 		//    /api/show for capabilities — both in parallel.
 		//    Health failure is graceful (pinned stays undefined → sorted last).
 		//    The /api/show probe set is pre-filtered by the cheap `/v1/models`
-		//    labels oracle (PLAN-2026-10-18 F-07/D-5): entries that provably
+		//    labels oracle: entries that provably
 		//    cannot qualify are never probed; everything else — including every
 		//    label-less entry on an older server — is probed as before, and
 		//    `/api/show` remains the authority that decides inclusion.
@@ -1559,7 +1558,6 @@ function resolveApiKey(
 
 // ── extension factory ────────────────────────────────────────────────────────
 
-// pi-lens-ignore: high-complexity
 export default async function (pi: ExtensionAPI) {
 	const fileConfig = await readExtensionConfig();
 	const config = readConfig(undefined, fileConfig);
@@ -1620,7 +1618,6 @@ export default async function (pi: ExtensionAPI) {
 	const warnStoreCorruption = (): void => {
 		if (storeCorruptionWarned) return;
 		storeCorruptionWarned = true;
-		// pi-lens-ignore: no-console-except-error,console-statement
 		console.warn(
 			`[pi-provider-lemonade] the persisted model store entry for provider ` +
 				`"${config.provider}" is malformed (unreadable, or models is not an array) — ` +
@@ -1889,8 +1886,8 @@ export default async function (pi: ExtensionAPI) {
 		 *
 		 *  Uses the pi 0.84+ contract (read-only `context.stored` snapshot +
 		 *  generation-checked `context.publish()`); pi 0.83 runtime support
-		 *  (context.store.read/write) was dropped — see
-		 *  historical/PLAN-2026-10-18.md F-03/D-3. */
+		 *  (context.store.read/write) was dropped — the publish transaction is
+		 *  the only persistence path. */
 		async refreshModels(
 			this: void,
 			context: RefreshModelsContext,
@@ -1926,21 +1923,30 @@ export default async function (pi: ExtensionAPI) {
 			const credential =
 				context.credential?.type === "api_key" ? context.credential : undefined;
 			const credentialUrl = credentialBaseUrl(credential);
-			// PLAN-2026-10-18 F-04/D-4: pi-ai 1.2.0 added `RefreshModelsContext.baseUrl`
+			// pi-ai 1.2.0 added `RefreshModelsContext.baseUrl`
 			// — the registered provider base URL including overrides that wrappers or
 			// models.json `providers.lemonade.baseUrl` apply OUTSIDE this extension.
-			// An override is a baseUrl that differs from our own env-derived config;
-			// when one is in play it must not be silently overridden by a stale saved
-			// `/login` credential URL. Precedence: saved credential URL, unless a
-			// models.json-level override exists → then `ctx.baseUrl`; else the
-			// env-derived config (a host that echoes our own baseUrl back changes
-			// nothing). Credential-URL per-model baseUrl behaviour is unchanged.
-			const overrideUrl =
-				typeof context.baseUrl === "string" &&
-				context.baseUrl.length > 0 &&
-				context.baseUrl !== config.baseUrl
-				? context.baseUrl
-				: undefined;
+			// pi-ai fills it from the registered provider object, whose baseUrl is
+			// `config.baseUrl + "/v1"` (the live-request dial base), so the raw value
+			// ALWAYS carries the `/v1` API suffix. Discovery builds its own `/v1/...`
+			// paths, so the value is normalized (trailing `/v1` stripped) before the
+			// comparison; comparing raw made our own baseUrl look like an override and
+			// dialled `<base>/v1/v1/models` (404) — every /model // /reload refresh
+			// failed with pi's "Could not refresh lemonade; showing cached models."
+			// An override (normalized) must not be silently overridden by a stale
+			// saved `/login` credential URL. Precedence: normalized override, then
+			// saved credential URL, then the env-derived config. Credential-URL
+			// per-model baseUrl behaviour is unchanged.
+			let overrideUrl: string | undefined;
+			if (typeof context.baseUrl === "string" && context.baseUrl.length > 0) {
+				try {
+					const normalized = normalizeLemonadeServerUrl(context.baseUrl);
+					if (normalized !== config.baseUrl) overrideUrl = normalized;
+				} catch {
+					// An unparseable override is ignored: discovery falls back to the
+					// credential/env base instead of failing the whole refresh.
+				}
+			}
 			const discoveryBaseUrl = overrideUrl ?? credentialUrl ?? config.baseUrl;
 			const discoveryConfig = { ...config, baseUrl: discoveryBaseUrl };
 			const { models, error } = await discoverModels(
@@ -2042,7 +2048,6 @@ export default async function (pi: ExtensionAPI) {
 		let warned = false;
 		pi.on(
 			"session_start",
-			// pi-lens-ignore: async-noise
 			async (_event: SessionStartEvent, ctx: ExtensionContext) => {
 				if (warned) return; // session_start fires per session — warn once per extension load
 				warned = true;
@@ -2053,7 +2058,6 @@ export default async function (pi: ExtensionAPI) {
 					// notices — stdout may be piped to the consumer in
 					// `pi -p` mode, where extra output would corrupt the
 					// response, while stderr stays visible to the operator.
-					// pi-lens-ignore: no-console-except-error,console-statement
 					console.warn(`[pi-provider-lemonade] ${message}`);
 				}
 			},
@@ -2067,7 +2071,6 @@ export default async function (pi: ExtensionAPI) {
 	let warnedCompletions = false;
 	pi.on(
 		"session_start",
-		// pi-lens-ignore: async-noise
 		async (_event: SessionStartEvent, ctx: ExtensionContext) => {
 			if (warnedCompletions) return; // session_start also fires on reload/switch
 			warnedCompletions = true;
@@ -2078,7 +2081,6 @@ export default async function (pi: ExtensionAPI) {
 				} else {
 					// console.warn (stderr) for both levels — see the
 					// discovery-notice handler above for why.
-					// pi-lens-ignore: no-console-except-error,console-statement
 					console.warn(`[pi-provider-lemonade] ${text}`);
 				}
 			};

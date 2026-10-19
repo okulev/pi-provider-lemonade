@@ -39,8 +39,7 @@ import {
 	type OpenAICompletionsOptions,
 } from "./pi-ai-compat/convert-messages.ts";
 // clampMaxTokensToContext/resolveSamplingParams are fork-owned copies
-// (src/pi-ai-compat/) — see the P1b note in the directory's provenance
-// headers. parseToolCallArguments moves to the pi-ai ROOT entry (root-exported
+// (src/pi-ai-compat/) — see the provenance headers in that directory. parseToolCallArguments moves to the pi-ai ROOT entry (root-exported
 // since 1.3.0, upstream #10944), removing the last `./utils/*` subpath
 // import — the root specifier resolves host-side under pi in both install
 // modes.
@@ -518,8 +517,7 @@ type ResolvedCompatKeys =
  * Note: passing a key through makes it visible to the request builder, not
  * necessarily acted on — the request-body features this fork never implemented
  * (cloud-only routing, prompt-cache retention, session-affinity headers,
- * `thinking_token_budget`) are still not emitted, as documented in the
- * lemonade-streaming skill.
+ * `thinking_token_budget`) are still not emitted.
  */
 type ResolvedCompat = Omit<CompatInput, ResolvedCompatKeys> & {
 	supportsStore: boolean;
@@ -648,7 +646,6 @@ function resolveReasoningEffort(
  * models.json `modelOverrides` (thinkingFormat, chatTemplateKwargs,
  * thinkingLevelMap) behave identically to the built-in provider.
  */
-// pi-lens-ignore: high-complexity,high-fan-out
 function applyThinkingParams(
 	params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
 	model: Model<"openai-completions">,
@@ -660,7 +657,6 @@ function applyThinkingParams(
 	const enabled = effort !== undefined;
 
 	if (compat.thinkingFormat === "zai") {
-		// pi-lens-ignore: no-as-any,no-any-type
 		const zaiParams = params as any;
 		zaiParams.thinking = effort
 			? { type: "enabled", clear_thinking: false }
@@ -674,7 +670,6 @@ function applyThinkingParams(
 	}
 
 	if (compat.thinkingFormat === "qwen") {
-		// pi-lens-ignore: no-as-any,no-any-type
 		const qwenParams = params as any;
 		qwenParams.enable_thinking = enabled;
 		if (effort && compat.supportsReasoningEffort) {
@@ -685,7 +680,6 @@ function applyThinkingParams(
 	}
 
 	if (compat.thinkingFormat === "qwen-chat-template") {
-		// pi-lens-ignore: no-as-any,no-any-type
 		(params as any).chat_template_kwargs = {
 			enable_thinking: enabled,
 			preserve_thinking: true,
@@ -700,14 +694,12 @@ function applyThinkingParams(
 			compat.chatTemplateKwargs,
 		);
 		if (kwargs) {
-			// pi-lens-ignore: no-as-any,no-any-type
 			(params as any).chat_template_kwargs = kwargs;
 		}
 		return;
 	}
 
 	if (compat.thinkingFormat === "baseten") {
-		// pi-lens-ignore: no-as-any,no-any-type
 		const basetenParams = params as any;
 		const args = buildChatTemplateValues(
 			model,
@@ -726,7 +718,6 @@ function applyThinkingParams(
 	}
 
 	if (compat.thinkingFormat === "deepseek") {
-		// pi-lens-ignore: no-as-any,no-any-type
 		const deepseekParams = params as any;
 		if (effort) {
 			deepseekParams.thinking = { type: "enabled" };
@@ -741,7 +732,6 @@ function applyThinkingParams(
 	}
 
 	if (compat.thinkingFormat === "openrouter") {
-		// pi-lens-ignore: no-as-any,no-any-type
 		const openRouterParams = params as any;
 		if (effort) {
 			openRouterParams.reasoning = {
@@ -759,7 +749,6 @@ function applyThinkingParams(
 		if (effort) {
 			const value = model.thinkingLevelMap?.[effort];
 			if (typeof value === "string") {
-				// pi-lens-ignore: no-as-any,no-any-type
 				(params as any).reasoning = { effort: value };
 			}
 		}
@@ -767,7 +756,6 @@ function applyThinkingParams(
 	}
 
 	if (compat.thinkingFormat === "together") {
-		// pi-lens-ignore: no-as-any,no-any-type
 		const togetherParams = params as any;
 		togetherParams.reasoning = { enabled };
 		if (effort && compat.supportsReasoningEffort) {
@@ -778,7 +766,6 @@ function applyThinkingParams(
 	}
 
 	if (compat.thinkingFormat === "string-thinking") {
-		// pi-lens-ignore: no-as-any,no-any-type
 		const stringThinkingParams = params as any;
 		if (effort) {
 			stringThinkingParams.thinking =
@@ -792,13 +779,11 @@ function applyThinkingParams(
 
 	// "openai" (default): OpenAI-style reasoning_effort
 	if (effort && compat.supportsReasoningEffort) {
-		// pi-lens-ignore: no-as-any,no-any-type
 		(params as any).reasoning_effort =
 			model.thinkingLevelMap?.[effort] ?? effort;
 	} else if (!effort && compat.supportsReasoningEffort) {
 		const offValue = model.thinkingLevelMap?.off;
 		if (typeof offValue === "string") {
-			// pi-lens-ignore: no-as-any,no-any-type
 			(params as any).reasoning_effort = offValue;
 		}
 	}
@@ -915,7 +900,6 @@ function buildParams(
 	options?: OpenAICompletionsOptions,
 	compat: ResolvedCompat = getCompat(model),
 ): OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming {
-	// pi-lens-ignore: no-as-any,no-any-type
 	const messages = sdkConvertMessages(model, context, compat as any);
 
 	const params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
@@ -925,7 +909,6 @@ function buildParams(
 	};
 
 	if (compat.supportsUsageInStreaming !== false) {
-		// pi-lens-ignore: no-as-any,no-any-type
 		(params as any).stream_options = { include_usage: true };
 	}
 
@@ -955,7 +938,6 @@ function buildParams(
 	);
 	if (maxTokens) {
 		if (compat.maxTokensField === "max_tokens") {
-			// pi-lens-ignore: no-as-any,no-any-type
 			(params as any).max_tokens = maxTokens;
 		} else {
 			params.max_completion_tokens = maxTokens;
@@ -1277,7 +1259,6 @@ function emptyUsage(): AssistantMessage["usage"] {
 export const stream: StreamFunction<
 	"openai-completions",
 	LemonadeCompletionsOptions
-	// pi-lens-ignore: high-complexity,high-fan-out
 > = (
 	model: Model<"openai-completions">,
 	context: ProviderContext,
@@ -1311,7 +1292,6 @@ export const stream: StreamFunction<
 	// streamed, so the terminal error message can explain why.
 	let retrySuppressed = false;
 
-	// pi-lens-ignore: high-complexity,high-fan-out
 	const executeStream = async () => {
 		// `output` outlives a single attempt, so each attempt has to reset what
 		// the previous one accumulated: otherwise a retry appends its text to the
@@ -1423,9 +1403,7 @@ export const stream: StreamFunction<
 				// parsed prefix. The in-flight delta parse below keeps
 				// parseStreamingJson (partial JSON is expected there).
 				Object.assign(block, parseToolCallArguments(block.partialArgs));
-				// pi-lens-ignore: ts-delete-property
 				delete block.partialArgs;
-				// pi-lens-ignore: ts-delete-property
 				delete block.streamIndex;
 				eventStream.push({
 					type: "toolcall_end",
@@ -1462,7 +1440,6 @@ export const stream: StreamFunction<
 			return thinkingBlock;
 		};
 
-		// pi-lens-ignore: high-complexity
 		const ensureToolCallBlock = (toolCall: {
 			index?: number;
 			id?: string;
@@ -1595,7 +1572,6 @@ export const stream: StreamFunction<
 				);
 				if (foundReasoningField) {
 					const delta = deltaFields[foundReasoningField] as string;
-					// pi-lens-ignore: deep-nesting
 					if (delta.length > 0) {
 						const block = ensureThinkingBlock(foundReasoningField);
 						block.thinking += delta;
@@ -1728,9 +1704,7 @@ export const stream: StreamFunction<
 			// clears both streaming scratch fields on a completed tool call.
 			const partial = output.content;
 			for (const block of partial) {
-				// pi-lens-ignore: ts-delete-property
 				delete (block as { partialArgs?: string }).partialArgs;
-				// pi-lens-ignore: ts-delete-property
 				delete (block as { streamIndex?: number }).streamIndex;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";

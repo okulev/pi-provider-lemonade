@@ -5,8 +5,7 @@
  * Copied because `convertMessages` (src/pi-ai-compat/convert-messages.ts)
  * needs it and pi-ai does not re-export it from its root entry; owning it
  * lets pi-ai live in `peerDependencies` (avoids the host-provided-packages
- * warning). Synced by the pi-ai-compat-sync skill — see
- * .agents/skills/pi-ai-compat-sync/SKILL.md. Do not edit the logic here
+ * warning). Synced whenever the @earendil-works/pi-ai devDependency pin moves — the procedure lives in the repository's agent docs. Do not edit the logic here
  * except to mirror an upstream change.
  */
 

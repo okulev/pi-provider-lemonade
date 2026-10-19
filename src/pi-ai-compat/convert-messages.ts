@@ -12,8 +12,9 @@
  * ./transform-messages.ts, ./constrained-sampling.ts; `getSystemMessageText`
  * and `renderSystemMessageUpdate` are re-imported from the pi-ai root entry
  * (root-exported). Owning this file lets pi-ai live in `peerDependencies`
- * (avoids the host-provided-packages warning). Synced by the
- * pi-ai-compat-sync skill — see .agents/skills/pi-ai-compat-sync/SKILL.md.
+ * (avoids the host-provided-packages warning). Synced whenever the
+ * @earendil-works/pi-ai devDependency pin moves — the
+ * procedure lives in the repository's agent docs.
  * Do not edit the logic here except to mirror an upstream change.
  */
 import type OpenAI from "openai";

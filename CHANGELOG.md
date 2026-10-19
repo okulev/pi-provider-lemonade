@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2026-10-20
+
+### Fixed
+
+- **`/model` and `/reload` could not refresh the Lemonade catalog** — every
+  refresh failed with pi's "Could not refresh lemonade; showing cached
+  models." message. pi-ai 1.3.0 hands the provider's registered base URL
+  (which includes the `/v1` API suffix) to the refresh callback; the URL was
+  used as-is, so discovery dialled `<server>/v1/v1/models` (404) instead of
+  `<server>/v1/models`. The suffix is now stripped before use, and a
+  models.json `baseUrl` override still takes precedence over the saved
+  `/login` server.
+
+### Changed
+
+- Internal comments in the published sources no longer reference
+  development-only files and tools (no functional change).
+
 ## [1.4.0] - 2026-10-18
 
 ### Added
@@ -563,6 +581,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because Lemonade expects a `"system"` role rather than `"developer"`.
 - **HTTPS not supported** — the base URL always uses `http://`.
 
+[1.4.1]: https://github.com/okulev/pi-provider-lemonade/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/okulev/pi-provider-lemonade/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/okulev/pi-provider-lemonade/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/okulev/pi-provider-lemonade/compare/v1.1.3...v1.2.0
