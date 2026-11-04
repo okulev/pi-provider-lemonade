@@ -1,7 +1,7 @@
 /**
  * Fork-owned copy of pi-ai's `utils/estimate.ts`.
  *
- * Provenance: @earendil-works/pi-ai 1.3.0, `dist/utils/estimate.js`
+ * Provenance: @earendil-works/pi-ai 1.5.0 (upstream unchanged since 1.3.0 — verified against dist on sync), `dist/utils/estimate.js`
  * (verbatim). Copied because `clampMaxTokensToContext`
  * (src/pi-ai-compat/simple-options.ts) needs `estimateContextTokens` and
  * pi-ai does not re-export it from its root entry; owning it lets pi-ai

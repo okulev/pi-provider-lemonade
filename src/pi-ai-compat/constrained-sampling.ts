@@ -3,7 +3,7 @@
  * `convertMessages`/`convertTools` (src/pi-ai-compat/convert-messages.ts)
  * need.
  *
- * Provenance: @earendil-works/pi-ai 1.3.0,
+ * Provenance: @earendil-works/pi-ai 1.5.0 (upstream unchanged since 1.3.0 — verified against dist on sync),
  * `dist/api/constrained-sampling.js` (verbatim subset — makeStrictJsonSchema
  * and its private closure, getJsonSchemaToolParameters, getGrammarToolInput,
  * resolveJsonSchemaStrictSampling, resolveGrammarConstrainedSampling and

@@ -2,7 +2,7 @@
  * Fork-owned copy of the pi-ai simple-options helpers the fork's request
  * builder needs.
  *
- * Provenance: @earendil-works/pi-ai 1.3.0, `dist/api/simple-options.js`
+ * Provenance: @earendil-works/pi-ai 1.5.0 (upstream unchanged since 1.3.0 — verified against dist on sync), `dist/api/simple-options.js`
  * (verbatim subset — resolveSamplingParams and clampMaxTokensToContext plus
  * their constants; buildBaseOptions, the thinking-budget helpers and
  * adjustMaxTokensForThinking are not used by the fork and are not copied).

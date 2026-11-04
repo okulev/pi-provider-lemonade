@@ -7,7 +7,7 @@ model there, and it shows up in pi's `/model` list. No `models.json` editing.
 
 ## What you need
 
-- [pi](https://pi.dev) installed (verified with pi 1.3.0; on a newer pi
+- [pi](https://pi.dev) installed (verified with pi 1.5.0; on a newer pi
   release, streaming should still work — and if it misbehaves, see
   [Troubleshooting](#troubleshooting) for a one-line switch).
 - [Lemonade Server](https://lemonade-server.ai) installed and running, with at

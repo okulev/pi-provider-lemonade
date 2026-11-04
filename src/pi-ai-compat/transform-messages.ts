@@ -2,7 +2,7 @@
  * Fork-owned copy of the pi-ai message transformer that `convertMessages`
  * (src/pi-ai-compat/convert-messages.ts) needs.
  *
- * Provenance: @earendil-works/pi-ai 1.3.0, `dist/api/transform-messages.js`
+ * Provenance: @earendil-works/pi-ai 1.5.0 (upstream unchanged since 1.3.0 — verified against dist on sync), `dist/api/transform-messages.js`
  * (verbatim subset — transformMessages and its private helpers;
  * splitErrorToolResultImages is not in the convert closure and is not
  * copied). Self-contained upstream: no pi-ai imports needed. Owning this

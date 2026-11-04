@@ -69,15 +69,32 @@ export interface BuiltinModelsCompatHints {
  *   `qwen` format cannot turn thinking on.
  * - `chat-template` + kwargs — LFM2.5 reads a boolean `thinking` kwarg;
  *   Muse-Glimmer reads a free-form `reasoning_strength` string (rendered
- *   into the system prompt as `Reasoning strength: <value>.`), resolved
- *   from the selected thinking level via `$var: "thinking.effort"` and
- *   omitted when thinking is off (the model is always-on — the strength
- *   is the only control it has).
+ *   into the system prompt as `Reasoning strength: <value>.`), and
+ *   DeepSeek-V4.1 reads `enable_thinking` as an alias for its
+ *   `thinking_mode` ("chat"/"thinking") — resolved from the selected
+ *   thinking level via `$var: "thinking.enabled"` / `$var:
+ *   "thinking.effort"`. The V4.1 kwarg form matters because its template
+ *   strictly validates `reasoning_effort` ("low"/"medium"/"high"/"max" or
+ *   an int 1–100): the server's disable path rewrites `reasoning_effort`
+ *   to `"none"` on every disable-intent request, which would raise a
+ *   template exception under `qwen`/`qwen-chat-template`/`openai` — the
+ *   kwarg path never sends `reasoning_effort`, so OFF renders
+ *   `thinking_mode: "chat"` and the effort stays at its default. Muse
+ *   uses `$var: "thinking.effort"` and omits the kwarg when thinking is
+ *   off (the model is always-on — the strength is the only control it
+ *   has).
  */
 export function builtinModelsCompatHints(id: string): BuiltinModelsCompatHints | undefined {
 	const n = id.toLowerCase();
 	if (/deepseek-r1/.test(n)) return { thinkingFormat: "deepseek" };
 	if (/qwen3\.8/.test(n)) return { thinkingFormat: "qwen" };
+	if (/k2-horizon/.test(n)) return { thinkingFormat: "qwen" };
+	if (/deepseek-v4\.1/.test(n)) {
+		return {
+			thinkingFormat: "chat-template",
+			chatTemplateKwargs: { enable_thinking: { $var: "thinking.enabled" } },
+		};
+	}
 	if (
 		/qwen|minicpm|nemotron|promptbridge|smollm3|ornith|deepseek-v4|gemma-?4|cogito/.test(
 			n,
@@ -119,6 +136,14 @@ export function builtinModelsCompatHints(id: string): BuiltinModelsCompatHints |
  * - Muse-Glimmer — `reasoning_strength` is a free-form string (default
  *   `high`): the same range as gpt-oss, delivered through
  *   `chatTemplateKwargs` (see `builtinModelsCompatHints`).
+ * - K2-Horizon — strict enum `high`/`medium`/`low` (anything else raises a
+ *   template exception; the disable branch precedes the effort chain, so
+ *   the server's disable-path `reasoning_effort: "none"` rewrite is safe):
+ *   `low`/`medium`/`high` exposed, `minimal`/`xhigh` hidden.
+ * - GLM-5.3 — enum `low`/`high`, anything else (including the server's
+ *   disable-path `"none"`) falls back to `max`: thinking cannot be turned
+ *   off, so `off` is hidden (clampThinkingLevel maps an off request to
+ *   `low` instead of lying); `minimal`/`medium`/`xhigh` hidden.
  * - Jan — always-on with no off-switch (all three disable paths verified
  *   inert), but it genuinely reasons: a medium-only map, so the selector
  *   shows a read-only "thinking: medium" instead of a dead "off".
@@ -133,6 +158,26 @@ export function builtinModelsThinkingLevelMap(id: string): ThinkingLevelMap | un
 			medium: "medium",
 			high: null,
 			xhigh: "xhigh",
+		};
+	}
+	if (/k2-horizon/.test(n)) {
+		return {
+			off: "none",
+			minimal: null,
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: null,
+		};
+	}
+	if (/glm-5\.3/.test(n)) {
+		return {
+			off: null,
+			minimal: null,
+			low: "low",
+			medium: null,
+			high: "high",
+			xhigh: null,
 		};
 	}
 	if (/gpt-oss/.test(n) || /muse-glimmer/.test(n)) {

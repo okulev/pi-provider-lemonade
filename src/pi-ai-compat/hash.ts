@@ -1,7 +1,7 @@
 /**
  * Fork-owned copy of pi-ai's `utils/hash.ts` (`shortHash` only).
  *
- * Provenance: @earendil-works/pi-ai 1.3.0, `dist/utils/hash.js` (verbatim).
+ * Provenance: @earendil-works/pi-ai 1.5.0 (upstream unchanged since 1.3.0 — verified against dist on sync), `dist/utils/hash.js` (verbatim).
  * Copied because `convertMessages` (src/pi-ai-compat/convert-messages.ts)
  * needs it and pi-ai does not re-export it from its root entry; owning it
  * lets pi-ai live in `peerDependencies` (avoids the host-provided-packages

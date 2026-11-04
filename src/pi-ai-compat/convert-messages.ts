@@ -2,7 +2,7 @@
  * Fork-owned copy of pi-ai's `convertMessages`/`convertTools` from
  * `api/openai-completions.ts`.
  *
- * Provenance: @earendil-works/pi-ai 1.3.0,
+ * Provenance: @earendil-works/pi-ai 1.5.0,
  * `dist/api/openai-completions.js` (verbatim: convertMessages, convertTools
  * and their file-local helpers — the is*ContentBlock guards, the OpenAI
  * reasoning-detail parsers, isOpenAICompletionsReasoningField — plus the
@@ -269,10 +269,14 @@ export function convertMessages(
 	const transformedMessages = transformMessages(normalizedContext.messages, model, (id) => normalizeToolCallId(id));
 	const transcriptTools = resolveTranscriptTools(
 		normalizedContext.messages,
-		compat.supportsMidConvoSystemMessages === true && compat.supportsMidConvoToolAdditions === true,
+		compat.supportsMidConvoSystemMessages === true && compat.supportsMidConvoToolAdditions === true
+			? "additions"
+			: "none",
 	);
 	const instructionRole = model.reasoning && compat.supportsDeveloperRole ? "developer" : "system";
+
 	let lastRole: string | null = null;
+	let systemIndex = 0;
 	for (let i = 0; i < transformedMessages.length; i++) {
 		const msg = transformedMessages[i];
 		// Some providers don't allow user messages directly after tool results
@@ -284,7 +288,8 @@ export function convertMessages(
 			});
 		}
 		if (msg.role === "system") {
-			const addedTools = i > 0 && transcriptTools.anchorsAdditions ? (msg.toolsAdded ?? []) : [];
+			// transformMessages keeps system messages in order, so their position matches the transcript.
+			const addedTools = systemIndex++ >= transcriptTools.foldedSystemMessages ? (msg.toolsAdded ?? []) : [];
 			if (addedTools.length > 0) {
 				const kimiToolMessage = {
 					role: "system",
@@ -457,7 +462,7 @@ export function convertMessages(
 					.join("\n");
 				const hasImages = toolMsg.content.some((c) => c.type === "image");
 				// Always send tool result with text (or placeholder if only images)
-				const hasText = textResult.length > 0;
+				const hasText = textResult.trim().length > 0;
 				const toolResultText = hasText ? textResult : hasImages ? "(see attached image)" : "(no tool output)";
 				// Some providers require the 'name' field in tool results
 				const toolResultMsg: OpenAI.Chat.Completions.ChatCompletionToolMessageParam = {

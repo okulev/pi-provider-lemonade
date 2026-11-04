@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.2] - 2026-11-04
+
+### Changed
+
+- **pi 1.5.0 compatibility** — the extension's bundled pi-ai internals
+  (message conversion, transcript tool handling, token estimation) are synced
+  to the pi-ai 1.5.0 generation, and the development type-check pins move to
+  `@earendil-works/pi-ai` `~1.5.0` / `@earendil-works/pi-coding-agent`
+  `~1.5.0`. Verified end-to-end against the pi 1.5.0 release binary against a
+  live Lemonade server: discovery, streaming, and tool-call round trips.
+- Whitespace-only tool results now produce the same `(no tool output)`
+  placeholder as empty results (upstream pi-ai fix, present since 1.4.0).
+- Thinking support for the new Lemonade builtin models:
+  - **GLM-5.3-Flash** — graded effort with `low`/`high` selector levels. The
+    template has no off-switch (its default is the maximum effort), so those
+    are the only honest options.
+  - **K2-Horizon** (0.9B – 36B MoVA) — full off/low/medium/high support.
+  - **DeepSeek-V4.1-Flash** — on/off via its chat-template kwarg. Necessary
+    because the model's template strictly validates `reasoning_effort`, and
+    the server's thinking-off path rewrites that field to `none`, which the
+    template rejects — the kwarg route never sends the field.
+  - **Qwen3.8-Flash-Next** and the new container-backend re-quotes (Gufo,
+    Halogen, ROCm FP4, DS4) follow the existing family rules.
+  - **Flint** — shows the thinking selector (reasoning is always-on; the
+    template has no toggle).
+  - The new container backends (`gufo`, `halogen`, `rocmfpx`) sort as local
+    models.
+
 ## [1.4.1] - 2026-10-20
 
 ### Fixed
@@ -581,6 +609,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because Lemonade expects a `"system"` role rather than `"developer"`.
 - **HTTPS not supported** — the base URL always uses `http://`.
 
+[1.4.2]: https://github.com/okulev/pi-provider-lemonade/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/okulev/pi-provider-lemonade/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/okulev/pi-provider-lemonade/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/okulev/pi-provider-lemonade/compare/v1.2.0...v1.3.0
