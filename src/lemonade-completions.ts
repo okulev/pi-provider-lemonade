@@ -547,7 +547,11 @@ function getCompat(model: Model<"openai-completions">): ResolvedCompat {
 	return {
 		...compat,
 		supportsStore: compat?.supportsStore ?? true,
-		supportsDeveloperRole: compat?.supportsDeveloperRole ?? true,
+		// pi-ai 1.6.0 sends the developer role only to api.openai.com (#10741);
+		// every other host — Lemonade included — gets system. Registered Lemonade
+		// models set this explicitly via toModel; this default only covers models
+		// without compat, where system is the safe choice.
+		supportsDeveloperRole: compat?.supportsDeveloperRole ?? false,
 		supportsReasoningEffort: compat?.supportsReasoningEffort ?? true,
 		supportsUsageInStreaming: compat?.supportsUsageInStreaming ?? true,
 		supportsFinishReason: compat?.supportsFinishReason ?? true,
@@ -1016,6 +1020,7 @@ function parseChunkUsage(
 			cache_write_tokens?: number;
 		};
 		completion_tokens_details?: { reasoning_tokens?: number };
+		reasoning_tokens?: number;
 	},
 	model: Model<"openai-completions">,
 ): AssistantMessage["usage"] {
@@ -1041,7 +1046,10 @@ function parseChunkUsage(
 		output: outputTokens,
 		cacheRead: cacheReadTokens,
 		cacheWrite: cacheWriteTokens,
-		reasoning: rawUsage.completion_tokens_details?.reasoning_tokens || 0,
+		// Mirrors upstream openai-completions.ts: some OpenAI-compatible backends
+		// report reasoning tokens at the top level of usage instead of nesting
+		// them under completion_tokens_details.
+		reasoning: rawUsage.completion_tokens_details?.reasoning_tokens || rawUsage.reasoning_tokens || 0,
 		totalTokens: input + outputTokens + cacheReadTokens + cacheWriteTokens,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};

@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.3] - 2026-11-20
+
+### Changed
+
+- **pi 1.6.0 compatibility** — verified end-to-end against pi 1.6.0.
+- Tools with an untyped parameter node (e.g. `items: {}`) now fall back to
+  normal calling instead of failing, matching pi 1.6.0.
+- Reasoning tokens are counted when a server reports them outside
+  `completion_tokens_details`.
+
+### Added
+
+- Thinking support for the new Lemonade **LFM3** models.
+
+### Fixed
+
+- Gemma-4 **NPU** models no longer offer thinking levels that do nothing.
+
 ## [1.4.2] - 2026-11-04
 
 ### Changed
@@ -609,6 +627,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because Lemonade expects a `"system"` role rather than `"developer"`.
 - **HTTPS not supported** — the base URL always uses `http://`.
 
+[1.4.3]: https://github.com/okulev/pi-provider-lemonade/compare/v1.4.2...v1.4.3
 [1.4.2]: https://github.com/okulev/pi-provider-lemonade/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/okulev/pi-provider-lemonade/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/okulev/pi-provider-lemonade/compare/v1.3.0...v1.4.0

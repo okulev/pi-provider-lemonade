@@ -3,7 +3,7 @@
  * `convertMessages`/`convertTools` (src/pi-ai-compat/convert-messages.ts)
  * need.
  *
- * Provenance: @earendil-works/pi-ai 1.5.0 (upstream unchanged since 1.3.0 — verified against dist on sync),
+ * Provenance: @earendil-works/pi-ai 1.6.0 (upstream change since 1.5.0: makeJsonSchemaNodeStrict rejects nodes without type/anyOf/enum — #12049),
  * `dist/api/constrained-sampling.js` (verbatim subset — makeStrictJsonSchema
  * and its private closure, getJsonSchemaToolParameters, getGrammarToolInput,
  * resolveJsonSchemaStrictSampling, resolveGrammarConstrainedSampling and
@@ -113,6 +113,10 @@ function makeJsonSchemaNodeStrict(schema: SchemaNode, isUnsupportedKeyword?: Uns
 				throw new UnsupportedStrictJsonSchemaError(`${key}: ${JSON.stringify(value)} is unsupported`);
 			}
 		}
+	}
+	// OpenAI strict mode rejects nodes without a type; a bare enum counts as typed, a bare const does not.
+	if (schema.type === undefined && schema.anyOf === undefined && schema.enum === undefined) {
+		throw new UnsupportedStrictJsonSchemaError("schemas without a type are unsupported");
 	}
 	if (schema.anyOf !== undefined) {
 		if (!Array.isArray(schema.anyOf) || (schema.anyOf as unknown[]).length === 0) {

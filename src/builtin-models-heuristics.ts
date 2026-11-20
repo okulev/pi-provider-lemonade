@@ -63,7 +63,9 @@ export interface BuiltinModelsCompatHints {
  *   PromptBridge, SmolLM3, Cogito-v2, and Gemma-4 (`gemma-4`/`gemma4`
  *   — the canonical template reads the kwarg in both directions and
  *   injects `<|think|>` itself when enabled). Gemma-3 is excluded (its
- *   `/think` prompt tokens have no kwarg equivalent). Works for both ON
+ *   `/think` prompt tokens have no kwarg equivalent). LFM3 (both builtin
+ *   models share one template: `enable_thinking | default(true)` +
+ *   `preserve_thinking`, verified 2026-11-20). Works for both ON
  *   and OFF on llama.cpp and vLLM: Lemonade's server-side thinking
  *   normalization strips a top-level `enable_thinking: true`, so the
  *   `qwen` format cannot turn thinking on.
@@ -96,7 +98,7 @@ export function builtinModelsCompatHints(id: string): BuiltinModelsCompatHints |
 		};
 	}
 	if (
-		/qwen|minicpm|nemotron|promptbridge|smollm3|ornith|deepseek-v4|gemma-?4|cogito/.test(
+		/qwen|minicpm|nemotron|promptbridge|smollm3|ornith|deepseek-v4|gemma-?4|cogito|lfm3/.test(
 			n,
 		) ||
 		/glm-4\.[57]/.test(n)
@@ -236,6 +238,11 @@ export function builtinModelsThinkingLevelMap(id: string): ThinkingLevelMap | un
  *   variant is a pure proxy to the external AMD runtime with no
  *   thinking-handling code in the Lemonade path (external runtime
  *   unverified)
+ * - Gemma-4 NPU deployments (`-npu` ids, 2026-11-20 sync) — same
+ *   unverified AMD runtime, and the catalog labels no `reasoning` for
+ *   them; the template defaults thinking OFF and has no `/no_think`
+ *   priming, so a selector without verified `chat_template_kwargs`
+ *   support would be dead. The GGUF/MTP/ROCmFP4 variants stay included
  *
  * Jan is the one static-always-on family that IS included — but only the
  * `v1` and `nano` lineages (`/^jan-(v1|nano)/`), which genuinely reason
@@ -266,7 +273,7 @@ export function isBuiltinModelsThinkingFamily(id: string): boolean {
 		/promptbridge/.test(n) ||
 		/smollm3/.test(n) ||
 		/ornith/.test(n) ||
-		/gemma-?4/.test(n) ||
+		/gemma-?4(?![\w-]*-npu\b)/.test(n) ||
 		/cogito/.test(n) ||
 		/^jan-(v1|nano)/.test(n)
 	);
